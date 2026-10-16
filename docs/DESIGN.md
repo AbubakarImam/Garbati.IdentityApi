@@ -2,7 +2,7 @@
 
 **Status:** Design v2 — ratified. All decisions below are Confirmed by the owner (Abubakar), most cross-checked against published standards before being confirmed (see citations throughout). No code exists yet; this document is what the first builder task implements.
 **Last updated:** 16 October 2026
-**Service name:** `IdentityApi` (confirmed, decision #27 below)
+**Service name:** `IdentityApi` (confirmed, decision #18 below)
 **Platform:** Garbati — see [`garbati-platform/ARCHITECTURE.md`](https://github.com/AbubakarImam/garbati-platform/blob/main/ARCHITECTURE.md) for the platform-wide map; this document never repeats that file, only this service's detail.
 **Decision history:** `garbati-platform/TASKS.md` D-9 (this document's ratification) and D-6 (token-verification timing). Supporting research: `garbati-platform/research/identityapi-design-review.md` (token design vs. RFC 8725/9068/7009/OWASP) and `garbati-platform/research/joint-account-approval-patterns.md` (joint-account approval mechanics vs. maker-checker/multisig/enterprise-approval practice).
 
@@ -25,7 +25,7 @@ This is v2 of the original design draft (preserved in git history; see the first
 5. LedgerApi must **not call IdentityApi directly** for each transaction. It verifies the grant locally using IdentityApi's trusted public key.
 6. Authorization grants have a **30-second validity window** in v1.
 7. The design accepts a limited race window in which a mandate may be revoked after a grant is issued but before it is used.
-8. **(v2)** IdentityApi generates `CustomerId` itself; it never travels into LedgerApi. The Orchestrator carries it from account creation (IdentityApi) through to mandate attachment (IdentityApi), and LedgerApi never learns a customer exists (decision #12 stays intact). See decision #19.
+8. **(v2)** IdentityApi generates `CustomerId` itself; it never travels into LedgerApi. The Orchestrator carries it from account creation (IdentityApi) through to mandate attachment (IdentityApi), and LedgerApi never learns a customer exists (decision #12 stays intact). See decision #16.
 9. **(v2)** Joint accounts are in v1 scope: an account can have more than one active mandate holder, with a configurable number of holders required to approve a debit. See Section 3.8 and decisions #28–#34.
 10. **(v2)** Decision-token verification on the LedgerApi side (decision #47) is deliberately **not built yet** — the demo ships without it, documented as a known limitation, and built once OrchestratorApi exists to actually call it (`garbati-platform` D-6). IdentityApi still issues real signed grants from day one; only LedgerApi's verification step is deferred.
 
@@ -44,13 +44,13 @@ IdentityApi does not hold ledger balances or post financial entries. A trusted O
 | Capability | V1 decision | Notes |
 |---|---|---|
 | Customer record creation and maintenance | In scope | Customer can exist before being fully verified. |
-| KYC status and current tier | In scope | Tier rules are configurable policy data, not hardcoded (decision #24). Exact Nigerian tier limits still need compliance confirmation — `garbati-platform/research/nigerian-regulatory-requirements.md`. |
+| KYC status and current tier | In scope | Tier rules are configurable policy data, not hardcoded (decision #11). Exact Nigerian tier limits still need compliance confirmation — `garbati-platform/research/nigerian-regulatory-requirements.md`. |
 | Customer-to-account mandate | In scope | **v2: multiple holders per account (joint accounts), not single-customer only.** See 2.2 and 3.8. |
-| Configurable multi-holder approval (M-of-N) | In scope (v2) | Section 3.8. Simple unweighted count only; no weighted votes or named-required-approvers in v1 (decision #29). |
+| Configurable multi-holder approval (M-of-N) | In scope (v2) | Section 3.8. Simple unweighted count only; no weighted votes or named-required-approvers in v1 (decision #20). |
 | Authorization check and signed grant issuance | In scope | Grant is specific to the transaction intent and valid for 30 seconds. Issued regardless of how many holders had to approve first. |
-| Customer authentication, passwords and end-user sessions | Out of scope | Owned by the channel/application (decision #20). IdentityApi receives a trusted customer identity from the authenticated flow. |
+| Customer authentication, passwords and end-user sessions | Out of scope | Owned by the channel/application (decision #15). IdentityApi receives a trusted customer identity from the authenticated flow. |
 | Biometric capture or biometric matching | Out of scope | A future provider or workflow may supply a verification result. |
-| OCR or raw identity-document storage | Out of scope | External secured storage and references only (decision #25). |
+| OCR or raw identity-document storage | Out of scope | External secured storage and references only (decision #12). |
 | Credit scoring or financing eligibility | Out of scope | Separate product/domain responsibility. |
 | Reversal authority, reason codes, reconciliation for unrecoverable external effects | **Not designed yet** | Deliberately deferred — `garbati-platform` T-015. Do not build this from inference; wait for that task. |
 | Compliance suspension, mandate revocation and privileged review | In scope | Restricted to authorized internal services or operators and fully audited. |
@@ -59,8 +59,8 @@ IdentityApi does not hold ledger balances or post financial entries. A trusted O
 ### 1.3 Actors
 
 - **Customer:** Acts through an approved channel; does not directly call the internal IdentityApi.
-- **Channel:** Authenticates the end customer, owns login/sessions entirely (decision #20), and submits the transaction request.
-- **Orchestrator:** Coordinates the flow; is the **only** component that calls LedgerApi for anything that changes ledger state, including account freezes (decision #21) — IdentityApi never calls LedgerApi to change state, only (narrowly) to read, per 2.4.
+- **Channel:** Authenticates the end customer, owns login/sessions entirely (decision #15), and submits the transaction request.
+- **Orchestrator:** Coordinates the flow; is the **only** component that calls LedgerApi for anything that changes ledger state, including account freezes (decision #17) — IdentityApi never calls LedgerApi to change state, only (narrowly) to read, per 2.4.
 - **IdentityApi:** Checks KYC, customer status, and mandate/approval permissions; signs an authorization grant when the request is approved.
 - **LedgerApi:** Verifies the grant (once #47 is built — see D-6), checks financial and account rules, and posts or rejects the transaction.
 - **Operations/compliance actor:** Performs restricted KYC review, customer suspension/reactivation and mandate revocation where authorized.
@@ -73,7 +73,7 @@ IdentityApi does not hold ledger balances or post financial entries. A trusted O
 
 ### 2.1 Customer
 
-Use an internally generated `CustomerId` as the stable identifier (decision #19) — never BVN, NIN, or an account number.
+Use an internally generated `CustomerId` as the stable identifier (decision #16) — never BVN, NIN, or an account number.
 
 Fields:
 
@@ -89,7 +89,7 @@ Sensitive identity fields are separated from ordinary operational fields (`Custo
 
 A customer **may exist with zero mandates**. Registration does not by itself grant permission to operate a ledger account. An unverified or otherwise ineligible customer must not receive an authorization grant for an operation that requires a higher KYC status/tier.
 
-**v2 — status-change cascades (decision #18):**
+**v2 — status-change cascades (decision #14):**
 
 | Status becomes | Effect | Reversible? |
 |---|---|---|
@@ -117,13 +117,13 @@ A mandate links **one customer** to **one existing Garbati ledger account** and 
 - `MandateId`
 - `Operation` (`View`, `Debit`, `Credit` as applicable)
 
-**v2 rule (decision #28, revising v1's single-mandate rule):** at most one **active** mandate per `(CustomerId, LedgerAccountId)` pair — enforced by a real database unique constraint (partial unique index `WHERE Status = 'Active'`), not application-level validation alone. Multiple *different* customers may each hold their own active mandate on the same account — that is what makes an account "joint." A mandate cannot become active until the referenced ledger account's existence has been confirmed.
+**v2 rule (decision #19, revising v1's single-mandate rule):** at most one **active** mandate per `(CustomerId, LedgerAccountId)` pair — enforced by a real database unique constraint (partial unique index `WHERE Status = 'Active'`), not application-level validation alone. Multiple *different* customers may each hold their own active mandate on the same account — that is what makes an account "joint." A mandate cannot become active until the referenced ledger account's existence has been confirmed.
 
 A revoked mandate is retained for history; it is not deleted or silently reactivated. Restoring access creates a new mandate with a new identifier.
 
 ### 2.3 KYC verification and tier policy
 
-Unchanged from v1, with the "configurable, not hardcoded" recommendation now **Confirmed** (decision #24): the customer's current tier is stored on the customer record; verification attempts/results are recorded separately; `KycTierPolicies` holds configurable jurisdiction/tier rules with effective dates, rather than limits spread through application code.
+Unchanged from v1, with the "configurable, not hardcoded" recommendation now **Confirmed** (decision #11): the customer's current tier is stored on the customer record; verification attempts/results are recorded separately; `KycTierPolicies` holds configurable jurisdiction/tier rules with effective dates, rather than limits spread through application code.
 
 `KycVerifications` fields: `Id`, `CustomerId`, `VerificationType`, `Provider`, `ProviderReference`, `Status`, `ResultCode`, `VerifiedAt`, `ExpiresAt`, minimal audit metadata.
 
@@ -133,7 +133,7 @@ Start with a Nigeria-oriented policy profile, but the actual limits must be conf
 
 ### 2.4 Account creation and mandate attachment
 
-Unchanged mechanism from v1, with the `CustomerId` flow made explicit (decision #19 — this is exactly the question the owner raised and confirmed mid-design):
+Unchanged mechanism from v1, with the `CustomerId` flow made explicit (decision #16 — this is exactly the question the owner raised and confirmed mid-design):
 
 1. Register the customer in IdentityApi — `CustomerId` is generated here, internal to IdentityApi.
 2. Complete required KYC checks and record the result.
@@ -141,7 +141,7 @@ Unchanged mechanism from v1, with the `CustomerId` flow made explicit (decision 
 4. The Orchestrator asks IdentityApi to attach a mandate, passing both `CustomerId` and the new `LedgerAccountId`. IdentityApi records this pairing in its own `Mandates` table — this is the **only** place the customer-to-account link exists.
 5. **(v2, joint accounts)** For a joint account, step 4 repeats once per holder, each creating their own `Mandate` row against the same `LedgerAccountId`. The account's `MandateApprovalPolicy` (2.2a) is set at this point, before any holder can transact.
 
-If account creation succeeds but mandate creation fails, the account remains without an active mandate. Retrying mandate creation must not create a duplicate ledger account. IdentityApi may validate an account reference through a narrowly scoped, **read-only** LedgerApi call during mandate setup; this is the one documented exception to "IdentityApi never calls LedgerApi," and it is read-only, never state-changing (decision #21 draws this line explicitly).
+If account creation succeeds but mandate creation fails, the account remains without an active mandate. Retrying mandate creation must not create a duplicate ledger account. IdentityApi may validate an account reference through a narrowly scoped, **read-only** LedgerApi call during mandate setup; this is the one documented exception to "IdentityApi never calls LedgerApi," and it is read-only, never state-changing (decision #17 draws this line explicitly).
 
 ### 2.2a MandateApprovalPolicy (v2, new entity)
 
@@ -155,7 +155,7 @@ Fields:
 
 `RequiredApprovals = 1` is the ordinary single-holder case (any one of the account's — usually one — holders acts alone; this is also the default for an account that only ever has one holder). `RequiredApprovals > 1` only makes sense once the account has at least that many active mandates; IdentityApi must reject a `RequiredApprovals` value greater than the account's current active-holder count.
 
-**v1 scope (decision #29):** `RequiredApprovals` is a simple, unweighted count over an unordered set of holders — "any M of N." No weighted votes, no naming of specific required individuals (e.g. "must include the primary holder"). This matches the standard default found across banking mandate types ("any one," "all," "any two"), bare multisig, and basic enterprise approval tiers (`research/joint-account-approval-patterns.md` Q2) — not the more complex variants those same domains also document.
+**v1 scope (decision #20):** `RequiredApprovals` is a simple, unweighted count over an unordered set of holders — "any M of N." No weighted votes, no naming of specific required individuals (e.g. "must include the primary holder"). This matches the standard default found across banking mandate types ("any one," "all," "any two"), bare multisig, and basic enterprise approval tiers (`research/joint-account-approval-patterns.md` Q2) — not the more complex variants those same domains also document.
 
 ### 2.5 Customer status and ledger account status
 
@@ -165,7 +165,7 @@ These are different controls and must not be conflated:
 - `KycStatus`/`KycTier` says whether the required verification policy is satisfied.
 - LedgerApi account status says whether the account itself can be used under ledger rules.
 
-**v2 — freeze ownership (decision #20):** IdentityApi never calls LedgerApi to change account state. When IdentityApi determines an account must be frozen (customer suspended with a freeze-warranting reason, or closed/deceased per 2.1), it writes a durable `OutboxMessages` row (7.1) describing the freeze request. **The Orchestrator** polls/consumes this outbox, calls LedgerApi to actually freeze the account, and writes back an acknowledgement. IdentityApi tracks acknowledgement state and retries (via the same outbox mechanism) until it is confirmed — a freeze is never marked complete just because a message was queued. This keeps the Orchestrator as the single gate for every ledger-state-changing action (matching `ARCHITECTURE.md` P-1), with no new exception carved out for IdentityApi.
+**v2 — freeze ownership (decision #17):** IdentityApi never calls LedgerApi to change account state. When IdentityApi determines an account must be frozen (customer suspended with a freeze-warranting reason, or closed/deceased per 2.1), it writes a durable `OutboxMessages` row (7.1) describing the freeze request. **The Orchestrator** polls/consumes this outbox, calls LedgerApi to actually freeze the account, and writes back an acknowledgement. IdentityApi tracks acknowledgement state and retries (via the same outbox mechanism) until it is confirmed — a freeze is never marked complete just because a message was queued. This keeps the Orchestrator as the single gate for every ledger-state-changing action (matching `ARCHITECTURE.md` P-1), with no new exception carved out for IdentityApi.
 
 LedgerApi must still independently enforce its own account freeze/status rules regardless of what IdentityApi believes has happened.
 
@@ -184,8 +184,8 @@ Supporting invariants:
 - A grant must not authorize a different transaction, account, amount, currency or operation.
 - A mandate cannot reference an unconfirmed customer or ledger account.
 - Revocation and privileged status changes must be auditable and must not silently delete history.
-- Failure to obtain an authorization decision must never be interpreted as approval (decision #23, fail-closed, confirmed — matches Saltzer & Schroeder's fail-safe-defaults principle).
-- **(v2)** A holder's already-given approval toward a joint account's threshold becomes void, immediately, the moment that holder's mandate is suspended or revoked — it is never carried forward as if still valid (decision #33).
+- Failure to obtain an authorization decision must never be interpreted as approval (decision #10, fail-closed, confirmed — matches Saltzer & Schroeder's fail-safe-defaults principle).
+- **(v2)** A holder's already-given approval toward a joint account's threshold becomes void, immediately, the moment that holder's mandate is suspended or revoked — it is never carried forward as if still valid (decision #24).
 
 ### 3.2 Confirmed transaction flow — single-holder (`RequiredApprovals = 1`)
 
@@ -212,7 +212,7 @@ Channel
 
 ### 3.3 Signed transaction authorization grant
 
-IdentityApi issues a cryptographically signed grant only after a successful authorization check — for a joint account, only once enough approvals (3.8) have been collected. Use a standard signed token format (JWS/JWT, asymmetric algorithm — ES256, pinned per decision #22). IdentityApi retains the private signing key; the Orchestrator and LedgerApi receive only the public verification key(s).
+IdentityApi issues a cryptographically signed grant only after a successful authorization check — for a joint account, only once enough approvals (3.8) have been collected. Use a standard signed token format (JWS/JWT, asymmetric algorithm — ES256, matching decision #4's choice of an asymmetric signed grant; the algorithm must be pinned on the verifier side per RFC 8725, `research/identityapi-design-review.md` Q1). IdentityApi retains the private signing key; the Orchestrator and LedgerApi receive only the public verification key(s).
 
 The grant binds, at minimum:
 
@@ -279,35 +279,35 @@ This section only applies when an account's `MandateApprovalPolicy.RequiredAppro
 
 The single-holder flow is "check one mandate, issue a grant" in one synchronous call. The joint-account flow splits this into two phases:
 
-1. **Collect approvals.** A holder requests a debit; IdentityApi opens a `PendingApprovalRequest` and counts the requester's own approval toward the threshold (decision #30 — the initiator **does** count as one of the M, unlike strict maker-checker; `research/joint-account-approval-patterns.md` Q1 flagged this as the one real choice between domains, and the owner chose the simpler multisig-style option). Other holders approve the same pending request through their own channel session.
+1. **Collect approvals.** A holder requests a debit; IdentityApi opens a `PendingApprovalRequest` and counts the requester's own approval toward the threshold (decision #21 — the initiator **does** count as one of the M, unlike strict maker-checker; `research/joint-account-approval-patterns.md` Q1 flagged this as the one real choice between domains, and the owner chose the simpler multisig-style option). Other holders approve the same pending request through their own channel session.
 2. **Issue the grant.** Once `M` distinct, currently-valid holder approvals exist for one `PendingApprovalRequest`, IdentityApi performs the ordinary single-holder authorization check (3.2) using the requester's own eligibility as the basis, and issues the signed grant exactly as before. Nothing about the grant itself (3.3) changes — it is still issued to, and verified by, exactly the same recipients.
 
 #### 3.8.2 Entities
 
 **`PendingApprovalRequest`:**
-- `Id` (the request-specific identifier every approval is bound to — decision #34, this is the nonce-equivalent that stops an approval given for one request ever counting toward a different one)
+- `Id` (the request-specific identifier every approval is bound to — decision #25, this is the nonce-equivalent that stops an approval given for one request ever counting toward a different one)
 - `LedgerAccountId`
 - `RequestedBy` (`CustomerId`)
 - Transaction intent: `Operation`, `DebitAccountId`, `CreditAccountId`, `Amount`, `Currency`, `IdempotencyKey` — the same canonical fields that will eventually appear in the grant (3.3), fixed at request-creation time so a later approval cannot be tricked into approving a changed transaction
 - `RequiredApprovals` (copied from the account's policy at request-creation time, so a concurrent policy change does not retroactively change what this specific request needs)
 - `Status`: `Pending`, `Approved`, `Expired`, `Cancelled`
-- `CreatedAt`, `ExpiresAt` (`CreatedAt + 1 hour` — decision #31)
+- `CreatedAt`, `ExpiresAt` (`CreatedAt + 1 hour` — decision #23)
 
 **`ApprovalRecord`:**
 - `PendingApprovalRequestId`
 - `CustomerId` (the approving holder — may be the same as `RequestedBy`, since the requester's own approval is recorded as the first `ApprovalRecord`)
 - `ApprovedAt`
-- `VoidedAt`, `VoidedReason` (nullable — set immediately if this holder's mandate is later suspended/revoked while the request is still `Pending`, decision #33)
+- `VoidedAt`, `VoidedReason` (nullable — set immediately if this holder's mandate is later suspended/revoked while the request is still `Pending`, decision #24)
 
 Unique constraint on `(PendingApprovalRequestId, CustomerId)` — a holder cannot approve the same request twice, and this is also how the requester's own implicit approval is represented (one row, created at the same time as the request itself).
 
-#### 3.8.3 Timeout and expiry (decision #31)
+#### 3.8.3 Timeout and expiry (decision #23)
 
 A `PendingApprovalRequest` expires **1 hour** after creation if it has not reached `RequiredApprovals` valid, non-voided `ApprovalRecord`s by then. On expiry: the request moves to `Expired` (an explicit, durable, auditable terminal state — never silent disappearance, and never honored late). A holder attempting to approve an `Expired` request gets a clear rejection; the only path forward is for a holder to create a **new** `PendingApprovalRequest`.
 
 This window is deliberately much longer than the 30-second machine-to-machine grant (3.6) — it assumes a human needs to notice a request and act, not a service completing a network call (`research/joint-account-approval-patterns.md` Q3: real systems range from minutes to indefinite; GARBATI's case — a live, customer-initiated debit — sits closer to "a human is actively present" than "a scheduled payment someone will get to eventually," hence 1 hour rather than a multi-day enterprise-style window).
 
-#### 3.8.4 Reconfiguring the threshold (decision #32)
+#### 3.8.4 Reconfiguring the threshold (decision #22)
 
 Changing an account's `MandateApprovalPolicy.RequiredApprovals` requires its own consent flow, structurally similar to 3.8.2–3.8.3 but with one deliberate difference: it requires a valid, non-voided `ApprovalRecord` from **every** currently active holder of the account — not merely enough holders to meet the account's *current* threshold.
 
@@ -315,13 +315,13 @@ This is the stricter of the two real-world patterns found in research (`research
 
 A threshold-change request uses the same `PendingApprovalRequest`/`ApprovalRecord` shape with a `Kind` discriminator (`Debit` vs `ThresholdChange`) and `RequiredApprovals` forced to the account's current active-holder count, not the account's current threshold.
 
-#### 3.8.5 Re-validation at the moment the threshold is met (decision #33)
+#### 3.8.5 Re-validation at the moment the threshold is met (decision #24)
 
 A holder's `ApprovalRecord` is voided immediately — not just on the next read — the moment that holder's mandate is suspended or revoked, whether or not the request has since reached its threshold on paper. Separately, **at the exact instant the `M`-th valid approval would complete the threshold**, IdentityApi re-checks every contributing approver's current mandate status one more time before issuing the grant — not just relying on each approval's state at the moment it was individually given.
 
 This closes a documented real hazard: multisig implementations that do not explicitly re-validate the pending-approval set when an owner's standing changes can let a removed signer's stale approval keep counting (`research/joint-account-approval-patterns.md` Q5). If a live re-check at threshold-completion time finds a now-void approval, the request's `Status` stays `Pending` (not `Approved`) and waits for a replacement approval from a currently-active holder — or expires per 3.8.3.
 
-#### 3.8.6 No caching, applies here too (decision #23)
+#### 3.8.6 No caching, applies here too (decision #9)
 
 The "never cache a positive authorization decision" rule (3.1, 4.1) applies to the *final* authorization check performed once the threshold is met — IdentityApi does not pre-approve or cache the outcome while still waiting on approvals. This does not mean the `PendingApprovalRequest`/`ApprovalRecord` rows themselves can't be stored (they must be, to track partial progress) — it means the actual authorize-and-sign decision is always made fresh, at the moment the threshold is satisfied, never reused from an earlier point in the same request's life.
 
@@ -331,13 +331,13 @@ The "never cache a positive authorization decision" rule (3.1, 4.1) applies to t
 
 ### 4.1 Check frequency and caching
 
-Check authorization for each customer-originated money-moving request. **v1 will not cache positive authorization decisions** (decision #23, Confirmed) — this avoids accepting a stale cached approval after a known revocation. The signed grant itself is the short-lived authorization artifact; its 30-second validity is the explicitly accepted window. See 3.8.6 for how this applies to the joint-account approval-collection phase specifically.
+Check authorization for each customer-originated money-moving request. **v1 will not cache positive authorization decisions** (decision #9, Confirmed) — this avoids accepting a stale cached approval after a known revocation. The signed grant itself is the short-lived authorization artifact; its 30-second validity is the explicitly accepted window. See 3.8.6 for how this applies to the joint-account approval-collection phase specifically.
 
 Measure end-to-end latency before optimizing. Any future cache requires an explicit staleness/revocation policy rather than an implicit default.
 
 ### 4.2 Service failures
 
-Garbati must **fail closed** for customer-originated operations that require IdentityApi authorization (decision #23, Confirmed — matches Saltzer & Schroeder's fail-safe-defaults principle):
+Garbati must **fail closed** for customer-originated operations that require IdentityApi authorization (decision #10, Confirmed — matches Saltzer & Schroeder's fail-safe-defaults principle):
 
 | Result | Behaviour |
 |---|---|
@@ -401,7 +401,7 @@ LedgerApi continues to authenticate the Orchestrator as a service using its exis
 
 ### 5.3 Which service calls which?
 
-The Orchestrator (or the designated trusted channel/payment service) calls IdentityApi before sending a customer-originated transaction to LedgerApi. LedgerApi does not call IdentityApi in the transaction path. **IdentityApi never calls LedgerApi except the one narrow, read-only account-existence check during mandate setup (2.4)** — every state-changing ledger action, including account freezes, goes through the Orchestrator (decision #20).
+The Orchestrator (or the designated trusted channel/payment service) calls IdentityApi before sending a customer-originated transaction to LedgerApi. LedgerApi does not call IdentityApi in the transaction path. **IdentityApi never calls LedgerApi except the one narrow, read-only account-existence check during mandate setup (2.4)** — every state-changing ledger action, including account freezes, goes through the Orchestrator (decision #17).
 
 ---
 
@@ -421,7 +421,7 @@ Prefer structured operational identifiers: `CustomerId` (opaque but still access
 
 ### 6.3 Audit events
 
-Keep durable audit events separate from diagnostic application logs (decision #25, Confirmed). Audit at least:
+Keep durable audit events separate from diagnostic application logs (decision #13, Confirmed). Audit at least:
 
 - Customer creation and privileged identity-data changes.
 - KYC verification outcomes and tier changes.
@@ -457,7 +457,7 @@ Audit events are append-only from ordinary application code, access-restricted a
 
 ### 7.2 Identity documents and sensitive data
 
-Unchanged from v1 (decision #25, Confirmed): no raw KYC document images in ordinary relational columns by default. Prefer references to a secured object store or external verification provider; store only the outcome and metadata required for authorization.
+Unchanged from v1 (decision #12, Confirmed): no raw KYC document images in ordinary relational columns by default. Prefer references to a secured object store or external verification provider; store only the outcome and metadata required for authorization.
 
 ### 7.3 Immutable versus mutable data
 
@@ -469,7 +469,7 @@ Unchanged from v1 (decision #25, Confirmed): no raw KYC document images in ordin
 
 ### 7.4 Cross-service integrity
 
-IdentityApi and LedgerApi have separate databases; no database foreign key crosses services. Enforce within IdentityApi, with a real database constraint (not application validation alone — decision #28), that the one-active-mandate-per-`(customer, account)` rule cannot be violated under concurrent requests.
+IdentityApi and LedgerApi have separate databases; no database foreign key crosses services. Enforce within IdentityApi, with a real database constraint (not application validation alone — decision #19), that the one-active-mandate-per-`(customer, account)` rule cannot be violated under concurrent requests.
 
 ---
 
@@ -513,7 +513,7 @@ Numbering continues from the original v1 draft (1–18). New v2 decisions are 19
 | 26 | Key-compromise procedure | Assume covered by planned rotation; document as a separate, faster procedure | **Confirmed, 16 Oct 2026: a separate, explicit "stop trusting this `kid` immediately" procedure, distinct from scheduled rotation (4.3.2).** Exact operational mechanism is an implementation detail for the builder. |
 | 27 | Decision-token verification timing (LedgerApi decision #47) | Build it before anything ships; ship the demo without it first | **Confirmed (`garbati-platform` D-6), 16 Oct 2026: ship the demo without it, documented as a known limitation, build #47 once OrchestratorApi exists.** IdentityApi still issues real signed grants from day one — only LedgerApi's verification step is deferred. |
 | 28 | Reversal authority, reason codes, reconciliation | Decide now; defer to a dedicated task | **Deferred, 16 Oct 2026, to `garbati-platform` T-015** — not a decision made in this document. See Section 8. |
-| 29 | Idempotency on customer creation | None; client key + request hash | **Confirmed, 16 Oct 2026: client-supplied `idempotencyKey` + request hash, mirroring LedgerApi decision #43.** `POST /v1/customers` requires an `idempotencyKey`, scoped to the calling client; a retry with the same key and a matching hash of the other fields returns the originally-created customer; the same key with a different hash is rejected (409). | OrchestratorApi's own design (`Garbati.OrchestratorApi/docs/DESIGN.md` Section 1.4) already assumed this guarantee exists — it derives `orch:{operationId}:create-customer` as a retry-safe key for calling this endpoint. Without it, a timed-out create-customer call that gets retried could create a duplicate customer. This was deliberately left out of T-016's first build as an open question (see that PR) rather than assumed; the owner has now confirmed it belongs here. **Note:** Section 2.2a and 3.8 of this document already use "decision #29" (and #30–#34) in body prose for an unrelated joint-account concept (`RequiredApprovals` shape, 3.8's approval mechanics) — a pre-existing mismatch between this document's Section 9 table numbering (19–28) and its own body-text numbering (29–34), not introduced by this change. This new #29 is the Section 9 *table's* #29; the body-prose "decision #29" elsewhere refers to something else entirely. Flagged for whoever next touches this document's numbering — not resolved here. |
+| 29 | Idempotency on customer creation | None; client key + request hash | **Confirmed, 16 Oct 2026: client-supplied `idempotencyKey` + request hash, mirroring LedgerApi decision #43.** `POST /v1/customers` requires an `idempotencyKey`, scoped to the calling client; a retry with the same key and a matching hash of the other fields returns the originally-created customer; the same key with a different hash is rejected (409). | OrchestratorApi's own design (`Garbati.OrchestratorApi/docs/DESIGN.md` Section 1.4) already assumed this guarantee exists — it derives `orch:{operationId}:create-customer` as a retry-safe key for calling this endpoint. Without it, a timed-out create-customer call that gets retried could create a duplicate customer. This was deliberately left out of T-016's first build as an open question (see that PR) rather than assumed; the owner has now confirmed it belongs here. **Numbering note (corrected 17 Oct 2026):** this document's body prose (Sections 1–7) previously cited decision numbers that didn't match this table — a pre-existing authoring error from when this table was first written, not something introduced by T-016's PR. Every body citation has been corrected to point at the table row it actually describes; this is the only decision this document assigns the number 29 to. |
 
 ---
 
