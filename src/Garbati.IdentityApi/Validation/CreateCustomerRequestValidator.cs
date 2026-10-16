@@ -27,6 +27,11 @@ public class CreateCustomerRequestValidator
             errors.Add("Email is not a valid email address.");
         }
 
+        if (IdempotencyKeyRule.Validate(request.IdempotencyKey) is { } error)
+        {
+            errors.Add(error);
+        }
+
         return errors;
     }
 }

@@ -117,6 +117,15 @@ namespace Garbati.IdentityApi.Migrations
                         .HasColumnType("text")
                         .HasColumnName("customer_status");
 
+                    b.Property<string>("IdempotencyKey")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("idempotency_key");
+
+                    b.Property<string>("InitiatedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("initiated_by");
+
                     b.Property<string>("JurisdictionCode")
                         .IsRequired()
                         .HasColumnType("text")
@@ -131,6 +140,11 @@ namespace Garbati.IdentityApi.Migrations
                         .HasColumnType("text")
                         .HasColumnName("kyc_tier");
 
+                    b.Property<string>("RequestHash")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("request_hash");
+
                     b.Property<DateTimeOffset>("UpdatedAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("updated_at");
@@ -141,6 +155,12 @@ namespace Garbati.IdentityApi.Migrations
                     b.HasIndex("CustomerId")
                         .IsUnique()
                         .HasDatabaseName("ix_customers_customer_id");
+
+                    b.HasIndex("InitiatedBy", "IdempotencyKey")
+                        .IsUnique()
+                        .HasDatabaseName("ix_customers_initiated_by_idempotency_key");
+
+                    NpgsqlIndexBuilderExtensions.AreNullsDistinct(b.HasIndex("InitiatedBy", "IdempotencyKey"), false);
 
                     b.ToTable("customers", null, t =>
                         {

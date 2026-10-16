@@ -29,6 +29,11 @@ public class IdentityDbContext(DbContextOptions<IdentityDbContext> options) : Db
         {
             entity.HasKey(c => c.Id);
             entity.HasIndex(c => c.CustomerId).IsUnique();
+            // Keys are scoped to the calling client, same scheme as LedgerApi's transactions/accounts
+            // (decision #42/#43), applied here per decision #29. Nulls not distinct: two customers
+            // created with no recognizable client (InitiatedBy null) and the same key still collide,
+            // the same "unknown client" bucket semantics LedgerApi uses.
+            entity.HasIndex(c => new { c.InitiatedBy, c.IdempotencyKey }).IsUnique().AreNullsDistinct(false);
             entity.Property(c => c.CustomerStatus).HasConversion<string>();
             entity.Property(c => c.KycStatus).HasConversion<string>();
             entity.ToTable(t => t.HasCheckConstraint(

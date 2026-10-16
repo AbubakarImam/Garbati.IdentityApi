@@ -10,8 +10,10 @@ namespace Garbati.IdentityApi.Tests.Authorization;
 [Collection("Api")]
 public class AuthorizationTests(ApiFixture fixture)
 {
-    private static string CreateCustomerBody() => """{"fullName":"Auth Test","jurisdictionCode":"NG"}""";
+    private static string CreateCustomerBody() =>
+        """{"fullName":"Auth Test","jurisdictionCode":"NG","idempotencyKey":"auth-test-create-customer"}""";
     private static string KycDecisionBody() => """{"kycStatus":"Pending","verificationType":"BVN","provider":"test-provider"}""";
+    private static string StatusChangeBody() => """{"reason":"auth test"}""";
 
     // Every endpoint with the one scope it requires. A non-existent customerId is fine: past
     // authorization the controller/service answers with 404, not 401/403.
@@ -20,10 +22,10 @@ public class AuthorizationTests(ApiFixture fixture)
         { "POST", "/v1/customers", CreateCustomerBody(), IdentityScopes.CustomerWrite },
         { "GET", "/v1/customers/CUS-DOESNOTEXIST", null, IdentityScopes.CustomerRead },
         { "PATCH", "/v1/customers/CUS-DOESNOTEXIST/kyc", KycDecisionBody(), IdentityScopes.KycManage },
-        { "POST", "/v1/customers/CUS-DOESNOTEXIST/suspend", "{}", IdentityScopes.CustomerWrite },
-        { "POST", "/v1/customers/CUS-DOESNOTEXIST/reactivate", "{}", IdentityScopes.CustomerWrite },
-        { "POST", "/v1/customers/CUS-DOESNOTEXIST/close", "{}", IdentityScopes.CustomerWrite },
-        { "POST", "/v1/customers/CUS-DOESNOTEXIST/mark-deceased", "{}", IdentityScopes.CustomerWrite },
+        { "POST", "/v1/customers/CUS-DOESNOTEXIST/suspend", StatusChangeBody(), IdentityScopes.CustomerWrite },
+        { "POST", "/v1/customers/CUS-DOESNOTEXIST/reactivate", StatusChangeBody(), IdentityScopes.CustomerWrite },
+        { "POST", "/v1/customers/CUS-DOESNOTEXIST/close", StatusChangeBody(), IdentityScopes.CustomerWrite },
+        { "POST", "/v1/customers/CUS-DOESNOTEXIST/mark-deceased", StatusChangeBody(), IdentityScopes.CustomerWrite },
     };
 
     private static HttpRequestMessage Request(string method, string path, string? body)

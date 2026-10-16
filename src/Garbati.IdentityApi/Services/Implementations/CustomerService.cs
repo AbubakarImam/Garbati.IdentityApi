@@ -1,4 +1,8 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using Garbati.IdentityApi.Auditing;
+using Garbati.IdentityApi.Authorization;
 using Garbati.IdentityApi.Contracts.Requests;
 using Garbati.IdentityApi.Contracts.Responses;
 using Garbati.IdentityApi.Data;
@@ -9,9 +13,24 @@ using Npgsql;
 
 namespace Garbati.IdentityApi.Services;
 
-public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogger) : ICustomerService
+public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogger, ICurrentClient currentClient) : ICustomerService
 {
     private const int MaxCustomerIdGenerationAttempts = 5;
+
+    // Fingerprint of the fields that define the customer being created, so a reused idempotency key with
+    // a different body is detected (decision #29, mirrors LedgerApi's AccountService.HashRequest).
+    private static string HashRequest(CreateCustomerRequest request)
+    {
+        var fields = JsonSerializer.Serialize(new[]
+        {
+            request.FullName,
+            request.JurisdictionCode,
+            request.CustomerReference ?? "",
+            request.Email ?? "",
+            request.PhoneNumber ?? "",
+        });
+        return Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes(fields)));
+    }
 
     private static CustomerResponse ToResponse(Customer customer) => new(
         customer.CustomerId,
@@ -24,9 +43,14 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
         customer.UpdatedAt);
 
     // We generate the CustomerId ourselves (decision #19/#16) and retry on the rare collision, the same
-    // shape as LedgerApi's account-number generation (AccountService.CreateAccountAsync).
+    // shape as LedgerApi's account-number generation (AccountService.CreateAccountAsync). The idempotency
+    // key (decision #29) shares the same retry loop, keyed off which unique constraint fired - exactly
+    // the scheme LedgerApi's decision #43 uses for POST /api/accounts.
     public async Task<CustomerResponse> CreateCustomerAsync(CreateCustomerRequest request, CancellationToken cancellationToken = default)
     {
+        var clientId = currentClient.ClientId;
+        var requestHash = HashRequest(request);
+
         for (var attempt = 1; attempt <= MaxCustomerIdGenerationAttempts; attempt++)
         {
             var now = DateTimeOffset.UtcNow;
@@ -40,6 +64,9 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
                 JurisdictionCode = request.JurisdictionCode,
                 CreatedAt = now,
                 UpdatedAt = now,
+                IdempotencyKey = request.IdempotencyKey,
+                InitiatedBy = clientId,
+                RequestHash = requestHash,
                 IdentityData = new CustomerIdentityData
                 {
                     FullName = request.FullName,
@@ -65,15 +92,33 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
                 await dbContext.SaveChangesAsync(cancellationToken);
                 return ToResponse(customer);
             }
-            catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: "23505" })
+            catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: "23505" } pgEx)
             {
                 // Detach everything this attempt staged, or the retry would try to save it a second time
-                // alongside the next attempt's rows. The only unique constraint on Customer is CustomerId
-                // (ix_customers_customer_id), so any 23505 here means the generated id collided; try again
-                // with a freshly generated one.
-                dbContext.Entry(customer).State = EntityState.Detached;
+                // alongside the next attempt's rows. The dependent (IdentityData) must be detached before
+                // its principal (Customer) - detaching the principal first leaves EF trying to null out a
+                // required, non-nullable foreign key on the now-orphaned dependent, which throws.
                 dbContext.Entry(customer.IdentityData).State = EntityState.Detached;
+                dbContext.Entry(customer).State = EntityState.Detached;
                 dbContext.Entry(audit).State = EntityState.Detached;
+
+                if (pgEx.ConstraintName == "ix_customers_initiated_by_idempotency_key")
+                {
+                    var existingCustomer = await dbContext.Customers.AsNoTracking().FirstOrDefaultAsync(
+                        c => c.InitiatedBy == clientId && c.IdempotencyKey == request.IdempotencyKey, cancellationToken);
+
+                    if (existingCustomer is null)
+                        throw new InvalidOperationException("Error retrieving the result of the existing idempotency key.");
+
+                    // Same key, different request: refuse rather than report the old customer as this one's (409).
+                    if (existingCustomer.RequestHash != requestHash)
+                        throw new DuplicateIdempotencyKeyException(
+                            $"Idempotency key '{request.IdempotencyKey}' was already used for a different request.");
+
+                    return ToResponse(existingCustomer);
+                }
+                // Otherwise the collision was on CustomerId (ix_customers_customer_id): loop around and
+                // try another one.
             }
         }
 

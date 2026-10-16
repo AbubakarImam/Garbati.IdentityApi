@@ -15,13 +15,14 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
     public Task InitializeAsync() => fixture.ResetAsync();
     public Task DisposeAsync() => Task.CompletedTask;
 
-    private static CreateCustomerRequest NewCustomerRequest(string fullName = "Ada Lovelace") =>
-        new(fullName, "NG", CustomerReference: null, Email: "ada@example.com", PhoneNumber: "+2348000000000");
+    private static CreateCustomerRequest NewCustomerRequest(string fullName = "Ada Lovelace", string idempotencyKey = "test-create-customer") =>
+        new(fullName, "NG", CustomerReference: null, Email: "ada@example.com", PhoneNumber: "+2348000000000", IdempotencyKey: idempotencyKey);
 
     private async Task<string> CreateCustomerAsync()
     {
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx)).CreateCustomerAsync(NewCustomerRequest());
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .CreateCustomerAsync(NewCustomerRequest(idempotencyKey: Guid.NewGuid().ToString()));
         return response.CustomerId;
     }
 
@@ -29,7 +30,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
     public async Task CreateCustomerAsync_CreatesAnActivePendingCustomer()
     {
         await using var ctx = fixture.CreateContext();
-        var service = new CustomerService(ctx, TestAudit.For(ctx));
+        var service = new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default);
 
         var response = await service.CreateCustomerAsync(NewCustomerRequest());
 
@@ -44,7 +45,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
     public async Task CreateCustomerAsync_StoresIdentityDataSeparately_FromTheCustomerRecord()
     {
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx)).CreateCustomerAsync(NewCustomerRequest());
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).CreateCustomerAsync(NewCustomerRequest());
 
         await using var verifyCtx = fixture.CreateContext();
         var customer = await verifyCtx.Customers.SingleAsync(c => c.CustomerId == response.CustomerId);
@@ -57,7 +58,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
     public async Task CreateCustomerAsync_RecordsAuditRow()
     {
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx)).CreateCustomerAsync(NewCustomerRequest());
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).CreateCustomerAsync(NewCustomerRequest());
 
         await using var verifyCtx = fixture.CreateContext();
         var audit = await verifyCtx.AuditEvents.SingleAsync();
@@ -71,7 +72,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
     public async Task GetCustomerAsync_ReturnsNull_WhenCustomerDoesNotExist()
     {
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx)).GetCustomerAsync("CUS-DOESNOTEXIST");
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).GetCustomerAsync("CUS-DOESNOTEXIST");
 
         Assert.Null(response);
     }
@@ -82,7 +83,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
 
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx)).GetCustomerAsync(customerId);
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).GetCustomerAsync(customerId);
 
         Assert.NotNull(response);
         Assert.Equal(customerId, response!.CustomerId);
@@ -102,7 +103,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var request = new KycDecisionRequest("Verified", "Tier1", "BVN", "test-provider", "ref-1", "OK", null);
 
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx)).RecordKycDecisionAsync(customerId, request);
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).RecordKycDecisionAsync(customerId, request);
 
         Assert.Equal("Verified", response.KycStatus);
         Assert.Equal("Tier1", response.KycTier);
@@ -124,7 +125,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var request = new KycDecisionRequest("Rejected", null, "BVN", "test-provider", null, "MISMATCH", null);
 
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx)).RecordKycDecisionAsync(customerId, request);
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).RecordKycDecisionAsync(customerId, request);
 
         Assert.Equal("Rejected", response.KycStatus);
         Assert.Null(response.KycTier);
@@ -137,7 +138,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
 
         await using var ctx = fixture.CreateContext();
         await Assert.ThrowsAsync<CustomerNotFoundException>(() =>
-            new CustomerService(ctx, TestAudit.For(ctx)).RecordKycDecisionAsync("CUS-DOESNOTEXIST", request));
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).RecordKycDecisionAsync("CUS-DOESNOTEXIST", request));
     }
 
     [Fact]
@@ -146,14 +147,14 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
         await using (var closeCtx = fixture.CreateContext())
         {
-            await new CustomerService(closeCtx, TestAudit.For(closeCtx))
+            await new CustomerService(closeCtx, TestAudit.For(closeCtx), TestCaller.Default)
                 .CloseCustomerAsync(customerId, new CustomerStatusChangeRequest("account closed by customer"));
         }
 
         var request = new KycDecisionRequest("Verified", "Tier1", "BVN", "test-provider", null, "OK", null);
         await using var ctx = fixture.CreateContext();
         await Assert.ThrowsAsync<InvalidCustomerStatusTransitionException>(() =>
-            new CustomerService(ctx, TestAudit.For(ctx)).RecordKycDecisionAsync(customerId, request));
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).RecordKycDecisionAsync(customerId, request));
     }
 
     [Fact]
@@ -162,7 +163,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
 
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx))
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
             .SuspendCustomerAsync(customerId, new CustomerStatusChangeRequest("fraud review"));
 
         Assert.Equal("Suspended", response.CustomerStatus);
@@ -179,12 +180,12 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
         await using (var ctx1 = fixture.CreateContext())
         {
-            await new CustomerService(ctx1, TestAudit.For(ctx1))
+            await new CustomerService(ctx1, TestAudit.For(ctx1), TestCaller.Default)
                 .SuspendCustomerAsync(customerId, new CustomerStatusChangeRequest("first suspension"));
         }
 
         await using var ctx2 = fixture.CreateContext();
-        var response = await new CustomerService(ctx2, TestAudit.For(ctx2))
+        var response = await new CustomerService(ctx2, TestAudit.For(ctx2), TestCaller.Default)
             .SuspendCustomerAsync(customerId, new CustomerStatusChangeRequest("second call"));
 
         Assert.Equal("Suspended", response.CustomerStatus);
@@ -200,13 +201,13 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
         await using (var closeCtx = fixture.CreateContext())
         {
-            await new CustomerService(closeCtx, TestAudit.For(closeCtx))
+            await new CustomerService(closeCtx, TestAudit.For(closeCtx), TestCaller.Default)
                 .CloseCustomerAsync(customerId, new CustomerStatusChangeRequest("closed"));
         }
 
         await using var ctx = fixture.CreateContext();
         await Assert.ThrowsAsync<InvalidCustomerStatusTransitionException>(() =>
-            new CustomerService(ctx, TestAudit.For(ctx))
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
                 .SuspendCustomerAsync(customerId, new CustomerStatusChangeRequest("too late")));
     }
 
@@ -216,15 +217,19 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
         await using (var suspendCtx = fixture.CreateContext())
         {
-            await new CustomerService(suspendCtx, TestAudit.For(suspendCtx))
+            await new CustomerService(suspendCtx, TestAudit.For(suspendCtx), TestCaller.Default)
                 .SuspendCustomerAsync(customerId, new CustomerStatusChangeRequest("review"));
         }
 
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx))
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
             .ReactivateCustomerAsync(customerId, new CustomerStatusChangeRequest("review cleared"));
 
         Assert.Equal("Active", response.CustomerStatus);
+
+        await using var verifyCtx = fixture.CreateContext();
+        var audit = await verifyCtx.AuditEvents.SingleAsync(a => a.Action == AuditActions.CustomerReactivated);
+        Assert.Contains("review cleared", audit.Details);
     }
 
     [Fact]
@@ -233,7 +238,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
 
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx))
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
             .ReactivateCustomerAsync(customerId, new CustomerStatusChangeRequest(null));
 
         Assert.Equal("Active", response.CustomerStatus);
@@ -245,13 +250,13 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
         await using (var deceasedCtx = fixture.CreateContext())
         {
-            await new CustomerService(deceasedCtx, TestAudit.For(deceasedCtx))
+            await new CustomerService(deceasedCtx, TestAudit.For(deceasedCtx), TestCaller.Default)
                 .MarkDeceasedAsync(customerId, new CustomerStatusChangeRequest("confirmed deceased"));
         }
 
         await using var ctx = fixture.CreateContext();
         await Assert.ThrowsAsync<InvalidCustomerStatusTransitionException>(() =>
-            new CustomerService(ctx, TestAudit.For(ctx))
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
                 .ReactivateCustomerAsync(customerId, new CustomerStatusChangeRequest("mistake")));
     }
 
@@ -261,7 +266,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
 
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx))
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
             .CloseCustomerAsync(customerId, new CustomerStatusChangeRequest("customer requested closure"));
 
         Assert.Equal("Closed", response.CustomerStatus);
@@ -269,6 +274,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         await using var verifyCtx = fixture.CreateContext();
         var audit = await verifyCtx.AuditEvents.SingleAsync(a => a.Action == AuditActions.CustomerClosed);
         Assert.Equal(customerId, audit.EntityId);
+        Assert.Contains("customer requested closure", audit.Details);
     }
 
     // DESIGN.md Section 2.1, decision #14: the task file leaves "409 or no-op" as a choice for a
@@ -279,13 +285,13 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
         await using (var closeCtx = fixture.CreateContext())
         {
-            await new CustomerService(closeCtx, TestAudit.For(closeCtx))
+            await new CustomerService(closeCtx, TestAudit.For(closeCtx), TestCaller.Default)
                 .CloseCustomerAsync(customerId, new CustomerStatusChangeRequest("first closure"));
         }
 
         await using var ctx = fixture.CreateContext();
         await Assert.ThrowsAsync<InvalidCustomerStatusTransitionException>(() =>
-            new CustomerService(ctx, TestAudit.For(ctx))
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
                 .CloseCustomerAsync(customerId, new CustomerStatusChangeRequest("second closure")));
     }
 
@@ -295,7 +301,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
 
         await using var ctx = fixture.CreateContext();
-        var response = await new CustomerService(ctx, TestAudit.For(ctx))
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
             .MarkDeceasedAsync(customerId, new CustomerStatusChangeRequest("death certificate received"));
 
         Assert.Equal("Deceased", response.CustomerStatus);
@@ -303,6 +309,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         await using var verifyCtx = fixture.CreateContext();
         var audit = await verifyCtx.AuditEvents.SingleAsync(a => a.Action == AuditActions.CustomerMarkedDeceased);
         Assert.Equal(customerId, audit.EntityId);
+        Assert.Contains("death certificate received", audit.Details);
     }
 
     [Fact]
@@ -311,13 +318,13 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
         await using (var deceasedCtx = fixture.CreateContext())
         {
-            await new CustomerService(deceasedCtx, TestAudit.For(deceasedCtx))
+            await new CustomerService(deceasedCtx, TestAudit.For(deceasedCtx), TestCaller.Default)
                 .MarkDeceasedAsync(customerId, new CustomerStatusChangeRequest("first notice"));
         }
 
         await using var ctx = fixture.CreateContext();
         await Assert.ThrowsAsync<InvalidCustomerStatusTransitionException>(() =>
-            new CustomerService(ctx, TestAudit.For(ctx))
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
                 .MarkDeceasedAsync(customerId, new CustomerStatusChangeRequest("second notice")));
     }
 
@@ -330,7 +337,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var customerId = await CreateCustomerAsync();
 
         await using var ctx = fixture.CreateContext();
-        await new CustomerService(ctx, TestAudit.For(ctx))
+        await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
             .CloseCustomerAsync(customerId, new CustomerStatusChangeRequest("closure"));
 
         await using var verifyCtx = fixture.CreateContext();
@@ -345,7 +352,7 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
     public async Task StatusChangeMethods_Throw_ForAnUnknownCustomer(string operation)
     {
         await using var ctx = fixture.CreateContext();
-        var service = new CustomerService(ctx, TestAudit.For(ctx));
+        var service = new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default);
         var request = new CustomerStatusChangeRequest("n/a");
 
         Task Act() => operation switch
@@ -357,5 +364,108 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         };
 
         await Assert.ThrowsAsync<CustomerNotFoundException>(Act);
+    }
+
+    // Idempotency on customer creation (decision #29), mirroring LedgerApi's AccountServiceTests for
+    // POST /api/accounts (decision #43) - same mechanics, same test shapes.
+
+    // Guards the orchestrator-retry scenario: a timed-out create, retried with the same idempotency key
+    // and the same body, must return the customer it already created instead of a second one.
+    [Fact]
+    public async Task CreateCustomerAsync_RetriedWithTheSameKeyAndBody_ReturnsTheSameCustomer_AndCreatesOnlyOne()
+    {
+        var request = NewCustomerRequest(idempotencyKey: "order-42");
+
+        await using var ctx1 = fixture.CreateContext();
+        var first = await new CustomerService(ctx1, TestAudit.For(ctx1), TestCaller.Default).CreateCustomerAsync(request);
+
+        await using var ctx2 = fixture.CreateContext();
+        var retry = await new CustomerService(ctx2, TestAudit.For(ctx2), TestCaller.Default).CreateCustomerAsync(request);
+
+        Assert.Equal(first.CustomerId, retry.CustomerId);
+
+        await using var verifyCtx = fixture.CreateContext();
+        Assert.Equal(1, await verifyCtx.Customers.CountAsync());
+    }
+
+    [Theory]
+    [InlineData("Other Name", "ada@example.com", "+2348000000000")]
+    [InlineData("Ada Lovelace", "someone-else@example.com", "+2348000000000")]
+    [InlineData("Ada Lovelace", "ada@example.com", "+2348000000001")]
+    public async Task CreateCustomerAsync_ReusedKeyForADifferentRequest_Throws409_AndCreatesOnlyOne(
+        string fullName, string email, string phoneNumber)
+    {
+        await using var ctx1 = fixture.CreateContext();
+        await new CustomerService(ctx1, TestAudit.For(ctx1), TestCaller.Default).CreateCustomerAsync(
+            new CreateCustomerRequest("Ada Lovelace", "NG", null, "ada@example.com", "+2348000000000", "order-42"));
+
+        await using var ctx2 = fixture.CreateContext();
+        await Assert.ThrowsAsync<DuplicateIdempotencyKeyException>(() =>
+            new CustomerService(ctx2, TestAudit.For(ctx2), TestCaller.Default).CreateCustomerAsync(
+                new CreateCustomerRequest(fullName, "NG", null, email, phoneNumber, "order-42")));
+
+        await using var verifyCtx = fixture.CreateContext();
+        Assert.Equal(1, await verifyCtx.Customers.CountAsync());
+    }
+
+    [Fact]
+    public async Task CreateCustomerAsync_SameKeyFromTwoClients_CreatesTwoSeparateCustomers()
+    {
+        var request = NewCustomerRequest(idempotencyKey: "order-42");
+
+        await using var ctx1 = fixture.CreateContext();
+        var fromA = await new CustomerService(ctx1, TestAudit.For(ctx1), new TestCaller("client-a")).CreateCustomerAsync(request);
+
+        await using var ctx2 = fixture.CreateContext();
+        var fromB = await new CustomerService(ctx2, TestAudit.For(ctx2), new TestCaller("client-b")).CreateCustomerAsync(request);
+
+        Assert.NotEqual(fromA.CustomerId, fromB.CustomerId);
+    }
+
+    [Fact]
+    public async Task CreateCustomerAsync_ConcurrentRequestsWithOneKeyAndDifferentBodies_OneSucceedsOneConflicts()
+    {
+        var attempts = new[] { "ada@example.com", "someone-else@example.com" }.Select(email => Task.Run(async () =>
+        {
+            await using var ctx = fixture.CreateContext();
+            try
+            {
+                await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).CreateCustomerAsync(
+                    new CreateCustomerRequest("Ada Lovelace", "NG", null, email, "+2348000000000", "key-1"));
+                return "ok";
+            }
+            catch (DuplicateIdempotencyKeyException)
+            {
+                return "conflict";
+            }
+        }));
+
+        var results = await Task.WhenAll(attempts);
+
+        Assert.Single(results, r => r == "ok");
+        Assert.Single(results, r => r == "conflict");
+        await using var verifyCtx = fixture.CreateContext();
+        Assert.Equal(1, await verifyCtx.Customers.CountAsync());
+    }
+
+    // The database's unique constraint, not application logic, is what guarantees this: two requests
+    // racing with the same key and the same body must still create exactly one customer between them.
+    [Fact]
+    public async Task CreateCustomerAsync_ConcurrentRequestsWithTheSameKeyAndSameBody_CreatesExactlyOneCustomer()
+    {
+        var request = NewCustomerRequest(idempotencyKey: "order-42");
+
+        var attempts = Enumerable.Range(0, 2).Select(_ => Task.Run(async () =>
+        {
+            await using var ctx = fixture.CreateContext();
+            var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).CreateCustomerAsync(request);
+            return response.CustomerId;
+        }));
+
+        var customerIds = await Task.WhenAll(attempts);
+
+        Assert.Equal(customerIds[0], customerIds[1]);
+        await using var verifyCtx = fixture.CreateContext();
+        Assert.Equal(1, await verifyCtx.Customers.CountAsync());
     }
 }

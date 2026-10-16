@@ -10,7 +10,8 @@ Content-Type: application/json
   "fullName": "Ada Lovelace",
   "jurisdictionCode": "NG",
   "email": "ada@example.com",
-  "phoneNumber": "+2348000000000"
+  "phoneNumber": "+2348000000000",
+  "idempotencyKey": "example-key-1"
 }
 
 ### Get a customer (replace the id with one from the create response)

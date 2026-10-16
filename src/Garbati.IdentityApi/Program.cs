@@ -28,7 +28,7 @@ try
         .ReadFrom.Services(services)
         .Enrich.FromLogContext());
 
-    builder.Services.AddControllers();
+    builder.Services.AddControllers(options => options.Filters.Add<IdempotencyKeyLoggingFilter>());
     // Lowercase route URLs in generated links and the Swagger docs.
     builder.Services.AddRouting(options => options.LowercaseUrls = true);
     builder.Services.AddEndpointsApiExplorer();
@@ -86,6 +86,7 @@ try
 
     builder.Services.AddScoped<CreateCustomerRequestValidator>();
     builder.Services.AddScoped<KycDecisionRequestValidator>();
+    builder.Services.AddScoped<CustomerStatusChangeRequestValidator>();
 
     var app = builder.Build();
 

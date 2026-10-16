@@ -48,6 +48,7 @@ public class ExceptionHandlingMiddleware(RequestDelegate next, ILogger<Exception
     {
         CustomerNotFoundException => (StatusCodes.Status404NotFound, "Customer not found."),
         InvalidCustomerStatusTransitionException => (StatusCodes.Status409Conflict, "Customer status transition not allowed."),
+        DuplicateIdempotencyKeyException => (StatusCodes.Status409Conflict, "Duplicate idempotency key."),
         _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred.")
     };
 }

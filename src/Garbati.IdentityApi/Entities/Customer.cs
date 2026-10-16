@@ -15,5 +15,12 @@ public class Customer
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 
+    // Idempotency for POST /v1/customers (decision #29, mirroring LedgerApi decision #43): the client's
+    // key, who sent it, and a hash of the request that produced this row. A retry with the same key and
+    // a matching hash returns this row; a different hash is rejected (409).
+    public string IdempotencyKey { get; set; } = null!;
+    public string? InitiatedBy { get; set; }
+    public string RequestHash { get; set; } = null!;
+
     public CustomerIdentityData? IdentityData { get; set; }
 }

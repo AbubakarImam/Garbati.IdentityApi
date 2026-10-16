@@ -18,6 +18,7 @@ public class MigrationTests(PostgresFixture fixture)
 
         Assert.Contains(applied, m => m.EndsWith("InitialCreate"));
         Assert.Contains(applied, m => m.EndsWith("SeedPlaceholderKycTierPolicies"));
+        Assert.Contains(applied, m => m.EndsWith("AddIdempotencyToCustomers"));
     }
 
     [Fact]
@@ -27,7 +28,8 @@ public class MigrationTests(PostgresFixture fixture)
 
         await AssertColumnsAsync(ctx, "customers",
             "id", "customer_id", "customer_reference", "customer_status", "kyc_status",
-            "kyc_tier", "jurisdiction_code", "created_at", "updated_at");
+            "kyc_tier", "jurisdiction_code", "created_at", "updated_at",
+            "idempotency_key", "initiated_by", "request_hash");
 
         await AssertColumnsAsync(ctx, "customer_identity_data",
             "id", "customer_id", "full_name", "email", "phone_number", "created_at", "updated_at");
