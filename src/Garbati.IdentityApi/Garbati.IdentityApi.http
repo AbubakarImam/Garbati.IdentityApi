@@ -1,0 +1,75 @@
+@baseUrl = http://localhost:5294
+@apiKey = REPLACE_WITH_A_DEV_KEY_FROM_appsettings.Development.json
+
+### Create a customer
+POST {{baseUrl}}/v1/customers
+X-Api-Key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "fullName": "Ada Lovelace",
+  "jurisdictionCode": "NG",
+  "email": "ada@example.com",
+  "phoneNumber": "+2348000000000",
+  "idempotencyKey": "example-key-1"
+}
+
+### Get a customer (replace the id with one from the create response)
+GET {{baseUrl}}/v1/customers/CUS-REPLACE-ME
+X-Api-Key: {{apiKey}}
+
+### Record a KYC decision
+PATCH {{baseUrl}}/v1/customers/CUS-REPLACE-ME/kyc
+X-Api-Key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "kycStatus": "Verified",
+  "kycTier": "Tier1",
+  "verificationType": "BVN",
+  "provider": "mock-provider",
+  "providerReference": "ref-123",
+  "resultCode": "OK"
+}
+
+### Suspend a customer
+POST {{baseUrl}}/v1/customers/CUS-REPLACE-ME/suspend
+X-Api-Key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "reason": "fraud review"
+}
+
+### Reactivate a customer
+POST {{baseUrl}}/v1/customers/CUS-REPLACE-ME/reactivate
+X-Api-Key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "reason": "review cleared"
+}
+
+### Close a customer
+POST {{baseUrl}}/v1/customers/CUS-REPLACE-ME/close
+X-Api-Key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "reason": "customer requested closure"
+}
+
+### Mark a customer deceased
+POST {{baseUrl}}/v1/customers/CUS-REPLACE-ME/mark-deceased
+X-Api-Key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "reason": "death certificate received"
+}
+
+### Health checks (no API key needed)
+GET {{baseUrl}}/health/live
+
+###
+GET {{baseUrl}}/health/ready

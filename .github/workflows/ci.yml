@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # "Run workflow" button: redeploy main without a new commit
+
+permissions:
+  contents: read
+
+# A new push to the same branch or PR cancels the run still in progress.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - run: dotnet restore
+      - run: dotnet build --no-restore -c Release
+
+      # Testcontainers starts Postgres in Docker, which GitHub's Ubuntu runners provide.
+      - run: dotnet test --no-build -c Release --logger trx --results-directory TestResults
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: TestResults
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: final
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build migrator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: migrator
+          push: false
+          cache-from: type=gha
+
+  # Mirrors LedgerApi's deploy job shape (its own ci.yml) for a future Azure App Service deployment.
+  # Only runs on a push to main, never on a pull request, so it cannot block or fail this PR's checks.
+  #
+  # NOT WIRED UP YET: RESOURCE_GROUP/APP_NAME/DB_SERVER/APP_URL below are placeholders, and the
+  # azure/login secrets (AZUREAPPSERVICE_CLIENTID_*, _TENANTID_*, _SUBSCRIPTIONID_*) do not exist for
+  # this repo yet. Per the task file: getting test/docker green is what matters for this task; this job
+  # needs the owner's actual Azure resource names and a configured federated credential before it can
+  # run for real. Flagged in the PR description.
+  deploy:
+    needs: [test, docker]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # lets azure/login exchange GitHub's OIDC token: no Azure password is stored anywhere
+      contents: read
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false # never stop a deploy halfway
+    env:
+      RESOURCE_GROUP: identity-rg # TODO (owner): real resource group name
+      APP_NAME: identityapi # TODO (owner): real App Service name
+      DB_SERVER: identityapi-db-san # TODO (owner): real Postgres Flexible Server name
+      APP_URL: https://CHANGE-ME.azurewebsites.net # TODO (owner): real App Service URL
+      FIREWALL_RULE: github-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # Publish the API project only: publishing the solution also ships the test project.
+      - name: Publish the API
+        run: |
+          dotnet publish src/Garbati.IdentityApi/Garbati.IdentityApi.csproj -c Release -o publish
+          rm -f publish/appsettings.Development.json
+          (cd publish && zip -qr ../app.zip .)
+
+      - name: Build the migration bundle
+        run: |
+          dotnet tool restore
+          dotnet ef migrations bundle --project src/Garbati.IdentityApi --configuration Release --output efbundle
+
+      # TODO (owner): set up a managed identity trusted for this repo's main branch (Deployment Center),
+      # the same way LedgerApi's ledgerapi-id-b111 is, then fill in the secret names below.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_IDENTITYAPI }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_IDENTITYAPI }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_IDENTITYAPI }}
+
+      # The App Service setting is the single source of truth: the connection string is not copied into GitHub.
+      - name: Read the connection string from App Service
+        run: |
+          cs=$(az webapp config connection-string list -g "$RESOURCE_GROUP" -n "$APP_NAME" --query "[?name=='IdentityDb'].value | [0]" -o tsv)
+          if [ -z "$cs" ]; then echo "::error::App Service has no IdentityDb connection string"; exit 1; fi
+          echo "::add-mask::$cs"
+          echo "IDENTITYDB=$cs" >> "$GITHUB_ENV"
+
+      - name: Allow this runner through the database firewall
+        run: |
+          ip=$(curl -fsS https://api.ipify.org)
+          az postgres flexible-server firewall-rule create -g "$RESOURCE_GROUP" --server-name "$DB_SERVER" \
+            --name "$FIREWALL_RULE" --start-ip-address "$ip" --end-ip-address "$ip" -o none
+
+      - name: Apply migrations
+        run: ./efbundle --connection "$IDENTITYDB"
+
+      # Runs even when an earlier step failed, so the runner's IP never stays allowed.
+      - name: Remove the runner's firewall rule
+        if: always()
+        run: |
+          az postgres flexible-server firewall-rule delete -g "$RESOURCE_GROUP" --server-name "$DB_SERVER" \
+            --name "$FIREWALL_RULE" --yes -o none || true
+
+      # --clean empties wwwroot first, so files from older deployments cannot linger.
+      - name: Deploy to App Service
+        run: az webapp deploy -g "$RESOURCE_GROUP" -n "$APP_NAME" --src-path app.zip --type zip --clean true
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 30); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/health/ready")" = "200" ] && break
+            sleep 10
+          done
+          ready=$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/health/ready")
+          unauthenticated=$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/v1/customers/CUS-SMOKETEST")
+          echo "/health/ready: $ready, request without a key: $unauthenticated"
+          [ "$ready" = "200" ] || { echo "::error::/health/ready did not return 200"; exit 1; }
+          [ "$unauthenticated" = "401" ] || { echo "::error::the API did not reject a request without a key"; exit 1; }
