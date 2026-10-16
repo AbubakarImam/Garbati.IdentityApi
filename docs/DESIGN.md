@@ -561,3 +561,47 @@ The v2 design should not be considered complete until automated tests prove at l
 - A holder who approves, is then suspended *after* the threshold was already met but *before* the grant was actually issued, is caught by the live re-check at threshold-completion time, not just by the original per-approval check.
 - An approval given for one `PendingApprovalRequest` cannot be submitted against, or counted toward, a different one, even for the identical amount/accounts.
 - An emergency key-compromise response (4.3.2) can take effect without waiting for the next scheduled rotation window.
+
+---
+
+## Appendix B. T-016 build notes (project skeleton, Customer, KYC)
+
+This appendix records what the first build task (`garbati-platform` T-016) actually built against this
+document, and the implementation judgment calls it had to make where this document does not spell out
+every detail. It does not change any ratified decision above. Per `AGENTS.md`, new decision numbers are
+assigned by the coordinator, not by the builder; the items below are proposed as `#TBD-n` for that.
+
+**Built:** `Customer`, `CustomerIdentityData`, `KycVerification`, `KycTierPolicy` (with a placeholder
+Nigerian seed, clearly marked as such), `AuditEvents`, `OutboxMessages`. Four endpoints from Section 5.1
+(`POST /v1/customers`, `GET /v1/customers/{customerId}`, `PATCH /v1/customers/{customerId}/kyc`,
+`POST /v1/customers/{customerId}/suspend`, `POST /v1/customers/{customerId}/reactivate`) plus two this
+task added (see `#TBD-1`). API-key auth with the `identity.customer.read`/`identity.customer.write`/
+`identity.kyc.manage` scopes from Section 5.2 (the full scope list from Section 5.2 is defined in code
+now, but only these three are wired to an endpoint yet). **Not built** (by explicit scope, deferred to
+T-017): `Mandates`, `MandatePermissions`, the joint-account entities, `/v1/mandates/*`,
+`/v1/authorization/*`, and any grant-signing code.
+
+- **`#TBD-1` (endpoint naming).** Section 5.1 lists only `suspend`/`reactivate`; it does not spell out
+  separate endpoints for becoming `Closed` or `Deceased`, even though Section 2.1's status table treats
+  them as distinct, terminal, irreversible states with their own cascade. T-016 added
+  `POST /v1/customers/{customerId}/close` and `POST /v1/customers/{customerId}/mark-deceased` rather than
+  overloading `suspend` for them. Proposed for the coordinator to ratify or rename.
+- **`#TBD-2` (repeat Closed/Deceased attempt).** Section 2.1 does not say what happens if `close` or
+  `mark-deceased` is called on a customer already in that state. T-016 chose **409**, matching LedgerApi's
+  own convention for a repeated terminal operation (`AlreadyReversedException` → 409), over a silent
+  no-op, so a second call carrying a different reason is never silently dropped. `suspend`/`reactivate`
+  remain idempotent (a repeat from the same status is a no-op, 200), since those are not terminal.
+- **`#TBD-3` (idempotency key on `POST /v1/customers`).** Section 5.1 does not list an idempotency key for
+  this endpoint, unlike LedgerApi's `POST /api/accounts`. T-016 built it **without** one, as a question for
+  the owner rather than a silent addition (adding one would be a scope decision beyond this task, per the
+  task file) — does customer creation need the same retry-safety guarantee account creation has?
+- **`#TBD-4` (`CustomerIdentityData` fields).** Kept to `FullName`/`Email`/`PhoneNumber` only — no BVN/NIN
+  column. Section 6.2's "never log raw BVN/NIN" rule implies the same care is needed for *storage*
+  (encryption at rest), which has not been decided yet; rather than guess at cryptography, that column is
+  left out entirely pending a follow-up decision (likely needed by T-017's KYC evidence work).
+- **`#TBD-5` (Closed/Deceased cascade, decision #14 — the known gap).** T-016 builds the status
+  transition, its audit event, and the target *shape* of the freeze outbox message
+  (`Contracts.Outbox.AccountFreezeRequestedPayload`), but **not** the mandate lookup itself — `Mandates`
+  does not exist until T-017. `CustomerService.CascadeMandateRevocationAndFreezeAsync` is a documented
+  no-op today; no mandate is revoked and no `OutboxMessages` row is written on this path yet. T-017 must
+  come back to that exact method. See the T-016 pull request for the full note.
