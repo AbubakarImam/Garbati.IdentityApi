@@ -15,7 +15,8 @@ namespace Garbati.IdentityApi.Controllers;
 public class CustomersController(
     ICustomerService customerService,
     CreateCustomerRequestValidator createCustomerRequestValidator,
-    KycDecisionRequestValidator kycDecisionRequestValidator) : ControllerBase
+    KycDecisionRequestValidator kycDecisionRequestValidator,
+    CustomerStatusChangeRequestValidator customerStatusChangeRequestValidator) : ControllerBase
 {
     [Authorize(Policy = IdentityScopes.CustomerWrite)]
     [HttpPost]
@@ -66,6 +67,12 @@ public class CustomersController(
         [FromBody] CustomerStatusChangeRequest request,
         CancellationToken cancellationToken)
     {
+        var errors = customerStatusChangeRequestValidator.Validate(request);
+        if (errors.Count > 0)
+        {
+            return BadRequest(errors);
+        }
+
         var customer = await customerService.SuspendCustomerAsync(customerId, request, cancellationToken);
         return Ok(customer);
     }
@@ -77,6 +84,12 @@ public class CustomersController(
         [FromBody] CustomerStatusChangeRequest request,
         CancellationToken cancellationToken)
     {
+        var errors = customerStatusChangeRequestValidator.Validate(request);
+        if (errors.Count > 0)
+        {
+            return BadRequest(errors);
+        }
+
         var customer = await customerService.ReactivateCustomerAsync(customerId, request, cancellationToken);
         return Ok(customer);
     }
@@ -91,6 +104,12 @@ public class CustomersController(
         [FromBody] CustomerStatusChangeRequest request,
         CancellationToken cancellationToken)
     {
+        var errors = customerStatusChangeRequestValidator.Validate(request);
+        if (errors.Count > 0)
+        {
+            return BadRequest(errors);
+        }
+
         var customer = await customerService.CloseCustomerAsync(customerId, request, cancellationToken);
         return Ok(customer);
     }
@@ -102,6 +121,12 @@ public class CustomersController(
         [FromBody] CustomerStatusChangeRequest request,
         CancellationToken cancellationToken)
     {
+        var errors = customerStatusChangeRequestValidator.Validate(request);
+        if (errors.Count > 0)
+        {
+            return BadRequest(errors);
+        }
+
         var customer = await customerService.MarkDeceasedAsync(customerId, request, cancellationToken);
         return Ok(customer);
     }
