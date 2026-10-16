@@ -367,7 +367,7 @@ Because grants expire after 30 seconds, participating services need synchronized
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/customers` | Create a customer record. |
+| `POST /v1/customers` | Create a customer record. Requires a client-supplied `idempotencyKey`, scoped to the calling client and bound to a hash of the request (decision #29) — mirrors LedgerApi's `POST /api/accounts` (decision #43). |
 | `GET /v1/customers/{customerId}` | Retrieve an appropriately redacted customer view for an authorized caller. |
 | `PATCH /v1/customers/{customerId}/kyc` | Record an authorized KYC status/tier decision. |
 | `POST /v1/customers/{customerId}/suspend` | Suspend a customer through a restricted workflow. |
@@ -513,6 +513,7 @@ Numbering continues from the original v1 draft (1–18). New v2 decisions are 19
 | 26 | Key-compromise procedure | Assume covered by planned rotation; document as a separate, faster procedure | **Confirmed, 16 Oct 2026: a separate, explicit "stop trusting this `kid` immediately" procedure, distinct from scheduled rotation (4.3.2).** Exact operational mechanism is an implementation detail for the builder. |
 | 27 | Decision-token verification timing (LedgerApi decision #47) | Build it before anything ships; ship the demo without it first | **Confirmed (`garbati-platform` D-6), 16 Oct 2026: ship the demo without it, documented as a known limitation, build #47 once OrchestratorApi exists.** IdentityApi still issues real signed grants from day one — only LedgerApi's verification step is deferred. |
 | 28 | Reversal authority, reason codes, reconciliation | Decide now; defer to a dedicated task | **Deferred, 16 Oct 2026, to `garbati-platform` T-015** — not a decision made in this document. See Section 8. |
+| 29 | Idempotency on customer creation | None; client key + request hash | **Confirmed, 16 Oct 2026: client-supplied `idempotencyKey` + request hash, mirroring LedgerApi decision #43.** `POST /v1/customers` requires an `idempotencyKey`, scoped to the calling client; a retry with the same key and a matching hash of the other fields returns the originally-created customer; the same key with a different hash is rejected (409). | OrchestratorApi's own design (`Garbati.OrchestratorApi/docs/DESIGN.md` Section 1.4) already assumed this guarantee exists — it derives `orch:{operationId}:create-customer` as a retry-safe key for calling this endpoint. Without it, a timed-out create-customer call that gets retried could create a duplicate customer. This was deliberately left out of T-016's first build as an open question (see that PR) rather than assumed; the owner has now confirmed it belongs here. **Note:** Section 2.2a and 3.8 of this document already use "decision #29" (and #30–#34) in body prose for an unrelated joint-account concept (`RequiredApprovals` shape, 3.8's approval mechanics) — a pre-existing mismatch between this document's Section 9 table numbering (19–28) and its own body-text numbering (29–34), not introduced by this change. This new #29 is the Section 9 *table's* #29; the body-prose "decision #29" elsewhere refers to something else entirely. Flagged for whoever next touches this document's numbering — not resolved here. |
 
 ---
 
@@ -591,10 +592,11 @@ T-017): `Mandates`, `MandatePermissions`, the joint-account entities, `/v1/manda
   own convention for a repeated terminal operation (`AlreadyReversedException` → 409), over a silent
   no-op, so a second call carrying a different reason is never silently dropped. `suspend`/`reactivate`
   remain idempotent (a repeat from the same status is a no-op, 200), since those are not terminal.
-- **`#TBD-3` (idempotency key on `POST /v1/customers`).** Section 5.1 does not list an idempotency key for
-  this endpoint, unlike LedgerApi's `POST /api/accounts`. T-016 built it **without** one, as a question for
-  the owner rather than a silent addition (adding one would be a scope decision beyond this task, per the
-  task file) — does customer creation need the same retry-safety guarantee account creation has?
+- **`#TBD-3` — resolved by decision #29 (Section 9).** T-016 originally built `POST /v1/customers`
+  *without* an idempotency key, raising it as an open question rather than silently adding one. The owner
+  has since confirmed it belongs here (OrchestratorApi's own design already assumed the guarantee exists);
+  `idempotencyKey` is now required, with the same client-scoped-key-plus-request-hash mechanics as
+  LedgerApi's `POST /api/accounts` (decision #43). See decision #29.
 - **`#TBD-4` (`CustomerIdentityData` fields).** Kept to `FullName`/`Email`/`PhoneNumber` only — no BVN/NIN
   column. Section 6.2's "never log raw BVN/NIN" rule implies the same care is needed for *storage*
   (encryption at rest), which has not been decided yet; rather than guess at cryptography, that column is
@@ -605,3 +607,9 @@ T-017): `Mandates`, `MandatePermissions`, the joint-account entities, `/v1/manda
   does not exist until T-017. `CustomerService.CascadeMandateRevocationAndFreezeAsync` is a documented
   no-op today; no mandate is revoked and no `OutboxMessages` row is written on this path yet. T-017 must
   come back to that exact method. See the T-016 pull request for the full note.
+
+**Also fixed (QA review of the T-016 PR):** `suspend`/`reactivate`/`close`/`mark-deceased` all require a
+non-empty `Reason` now (`CustomerStatusChangeRequestValidator`, 400 if missing) — the request's own
+comment already claimed this, but nothing enforced it until QA caught the gap. Section 6.3 expects these
+restricted workflows' audit record to carry "actor and reason," so a reason that can be silently omitted
+defeats that.

@@ -56,7 +56,7 @@ Service tests run against a real PostgreSQL container started by [Testcontainers
 
 | Method | Route | Purpose |
 |---|---|---|
-| `POST` | `/v1/customers` | Create a customer record (`CustomerStatus = Active`, `KycStatus = Pending`) |
+| `POST` | `/v1/customers` | Create a customer record (`CustomerStatus = Active`, `KycStatus = Pending`). Requires an `idempotencyKey` - see [Idempotency](#idempotency) |
 | `GET` | `/v1/customers/{customerId}` | Redacted customer view - never raw `CustomerIdentityData` fields |
 | `PATCH` | `/v1/customers/{customerId}/kyc` | Record a KYC verification attempt and status/tier decision |
 | `POST` | `/v1/customers/{customerId}/suspend` | Suspend a customer (idempotent if already suspended) |
@@ -75,8 +75,12 @@ Service tests run against a real PostgreSQL container started by [Testcontainers
 | `401` | Missing or unknown API key |
 | `403` | The API key lacks the endpoint's scope |
 | `404` | Customer not found |
-| `409` | Customer status transition not allowed (e.g. closing an already-Closed customer) |
+| `409` | Customer status transition not allowed (e.g. closing an already-Closed customer), or an idempotency key reused with a different request |
 | `500` | Unexpected error |
+
+### Idempotency
+
+`POST /v1/customers` requires a client-supplied `idempotencyKey` (1-128 characters: letters, digits, `-`, `_`, `.` or `:`), scoped to the calling API client - the same scheme as LedgerApi's `POST /api/accounts` (`docs/DESIGN.md` decision #29, mirroring LedgerApi decision #43). A retry with the same key and the same other fields returns the customer already created instead of a second one; the same key with different fields gets **409**.
 
 ### The Closed/Deceased cascade - known limitation
 
