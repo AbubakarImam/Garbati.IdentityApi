@@ -613,3 +613,90 @@ non-empty `Reason` now (`CustomerStatusChangeRequestValidator`, 400 if missing) 
 comment already claimed this, but nothing enforced it until QA caught the gap. Section 6.3 expects these
 restricted workflows' audit record to carry "actor and reason," so a reason that can be silently omitted
 defeats that.
+
+---
+
+## Appendix C. T-017 build notes (Mandates, single-holder authorization grant issuance)
+
+This appendix records what the second build task (`garbati-platform` T-017) actually built against this
+document, continuing Appendix B's numbering convention (`#TBD-n`). It does not change any ratified
+decision above, and it deliberately does **not** build Section 3.8's joint-account approval workflow —
+that is `garbati-platform` T-018, not started.
+
+**Built:** `Mandates`, `MandatePermissions`, `MandateApprovalPolicies` (always `RequiredApprovals = 1` —
+no logic anywhere branches on any other value), `AuthorizationDecisions` (a resolved-decision record for
+`GET /v1/authorization/requests/{id}` — **not** the T-018 `PendingApprovalRequest` entity: a
+single-holder request resolves synchronously). Five mandate endpoints and two authorization endpoints
+from Section 5.1 (`POST`/`GET /v1/customers/{customerId}/mandates`, `GET /v1/accounts/{ledgerAccountId}/mandates`,
+`GET /v1/mandates/{mandateId}`, `POST /v1/mandates/{mandateId}/revoke`, `POST`/`GET /v1/authorization/requests[/{id}]`).
+ES256 grant signing (`Signing/GrantSigner.cs`) using `Microsoft.IdentityModel.JsonWebTokens`/`Tokens`, keyed
+by `kid`, shaped for a second key to be added later (4.3.1) without a breaking config change. Wired
+`CustomerService.CascadeMandateRevocationAndFreezeAsync` (T-016's documented no-op) for real. **Not
+built** (by explicit scope, deferred to T-018): the joint-account entities (`PendingApprovalRequests`,
+`ApprovalRecords`), `.../requests/{id}/approve`, `/v1/accounts/{id}/approval-policy` and its
+change-request endpoint, any `RequiredApprovals > 1` logic, planned key rotation (4.3.1) and the
+emergency key-compromise procedure (4.3.2) themselves — only a config shape that does not block adding
+them later.
+
+- **`#TBD-6` (service interface naming).** `ITransactionAuthorizationService`, not `IAuthorizationService`
+  — the latter collides with ASP.NET Core's own `Microsoft.AspNetCore.Authorization.IAuthorizationService`,
+  which this project also references via `[Authorize]` policies. A build-time naming conflict, not a
+  design choice; flagging it so the name doesn't look arbitrary.
+- **`#TBD-7` (denial response shape).** Section 5.1 says a denial "provides a stable reason code" but
+  does not say whether that is a `200` body with `Approved: false` or a non-`2xx` status. T-017 chose
+  **422** (`AuthorizationDeniedException`, matching `ARCHITECTURE.md`'s "business-rule failure"
+  convention and T-016's existing exception→status-code pattern) over a `200` with a boolean flag, so a
+  caller can't accidentally treat a denial response as successful by skipping a field check. The decision
+  is still persisted and reachable via `GET /v1/authorization/requests/{id}` either way.
+- **`#TBD-8` (`CreditAccountId` required).** Section 3.3 calls it "when applicable," implying it could be
+  absent for some operation. T-017 requires it unconditionally on `POST /v1/authorization/requests` —
+  nothing in this task's scope (single-holder debit/credit requests) has a case where it's meaningfully
+  absent, and leaving it optional without a concrete absent-case to test against felt like guessing.
+  Revisit if/when an operation without a destination account is actually designed.
+- **`#TBD-9` (no idempotency enforcement on `POST /v1/authorization/requests`).** Per the task file's own
+  instruction to raise this as a question rather than silently add one: `IdempotencyKey` is a required,
+  format-validated *input* field (it ends up in the signed grant claim) but there is no dedup/uniqueness
+  storage for it the way `POST /v1/customers` has (decision #29). Section 5.1 does not ask for one here,
+  and each call is a fresh decide-and-sign step, not a record-creation step with duplicate-row risk.
+  Flagging for the owner/coordinator to confirm this reading is correct.
+- **`#TBD-10` (repeat mandate revoke is idempotent, not 409).** Unlike Customer's `Closed`/`Deceased`
+  (T-016's `#TBD-2`, chosen as 409-on-repeat because those are terminal, high-stakes transitions), a
+  second `POST /v1/mandates/{mandateId}/revoke` call against an already-revoked mandate returns the
+  existing state (200) rather than erroring. Nothing is lost by this: the original actor/reason/timestamp
+  are untouched, and Section 2.2 already treats a revoked mandate as retained-not-deleted history.
+- **`#TBD-11` (`SigningKeyOptions` requires ≥1 key; `ApiKeyOptions` does not).** `ApiKeyOptionsValidator`
+  treats zero configured clients as valid (an unusual but legitimate deployment, e.g. health-check-only).
+  Grant issuance cannot function with zero signing keys, so `SigningKeyOptionsValidator` fails
+  `ValidateOnStart` if `SigningKeys:Keys` is empty or `ActiveKid` doesn't resolve — fail fast at boot,
+  not on the first real authorization request.
+- **`#TBD-12` (grant claim set: literal task list, not Section 3.3's full prose list).** Section 3.3
+  separately lists "Grant/schema version" as a bound claim, but Section 3.5's own illustrative example
+  omits it, and the task file's own enumerated claim list (`iss, aud, typ, jti, sub, kid, operation,
+  debitAccountId, creditAccountId, amount, currency, idempotencyKey, mandateId, iat, exp`) also omits it.
+  T-017 followed the task file's literal list — no `ver` claim. `GrantSigner` does add a standard `nbf`
+  (pinned to `iat`) via `SecurityTokenDescriptor`, which is in neither list — ordinary JWT hygiene, not a
+  claim carrying any business meaning; flagging it as the one claim present beyond the literal
+  enumeration, in case the owner wants it removed for strict conformance.
+- **`#TBD-13` (`kid` claim appears twice).** Per Section 3.5's illustrative example, which shows `kid`
+  as a body claim. `GrantSigner` sets it there *and* as the real JOSE header parameter a verifier would
+  actually key off (RFC 8725 §3.1) — the header copy is the one that matters for verification; the body
+  copy exists only because the example shows it there.
+- **`#TBD-14` (account-existence check, Section 2.4).** Exactly the same honesty pattern as T-016's
+  cascade stub: `MandateService.AttachMandateAsync` has a clearly commented `TODO` where the narrow,
+  read-only LedgerApi account-existence call belongs, and does not fake one — LedgerApi has no code to
+  call yet. `LedgerAccountId` is accepted as an opaque, caller-asserted string.
+- **`#TBD-15` (dev/test ES256 signing keys committed openly).** Per the task file's explicit instruction:
+  a dev-only P-256 keypair is committed in `appsettings.Development.json`, clearly labeled, the same
+  transparency T-016 used for dev API key hashes — except here the *private key material itself* must be
+  present (there is no "hash" equivalent for a signing key). A separate test-only keypair
+  (`tests/.../Fixtures/TestSigningKey.cs`) is used by `ApiFixture`/service tests, kept apart from the dev
+  key so test and local-dev configuration never share a key. Neither is used, or usable, outside this
+  repository's own dev/test environments.
+- **Closed/Deceased cascade (decision #14) — T-016's `#TBD-5`, now resolved.** `CascadeMandateRevocation
+  AndFreezeAsync` queries every `Active` mandate the customer holds, revokes each in the same
+  `SaveChangesAsync` call as the customer's own status change, and queues one `AccountFreezeRequested`
+  outbox row per distinct `LedgerAccountId` where no other customer still holds an active mandate. T-016's
+  `CloseCustomerAsync_WritesNoOutboxMessage_BecauseMandatesDoNotExistYet` test — written specifically to
+  force this task to revisit it — is renamed to
+  `CloseCustomerAsync_WritesNoOutboxMessage_WhenTheCustomerHasNoMandates` and still asserts zero rows for
+  that one case; new tests cover the sole-holder (one row) and surviving-joint-holder (zero rows) cases.
