@@ -692,6 +692,36 @@ them later.
   (`tests/.../Fixtures/TestSigningKey.cs`) is used by `ApiFixture`/service tests, kept apart from the dev
   key so test and local-dev configuration never share a key. Neither is used, or usable, outside this
   repository's own dev/test environments.
+- **`#TBD-16` (`#TBD-15`'s Production guard — QA follow-up).** The owner's approval of `#TBD-15` was
+  conditional: something must refuse to start if the committed dev/test key is ever configured with
+  `ASPNETCORE_ENVIRONMENT=Production`. `SigningKeyOptionsValidator` now takes `IHostEnvironment` and, when
+  `hostEnvironment.IsProduction()`, fails `ValidateOnStart` if any configured key's **public key
+  material** fingerprint-matches the known dev key (`appsettings.Development.json`) or the known test
+  key (`tests/.../Fixtures/TestSigningKey.cs`) — see `KnownInsecureSigningKeys`. Matching on the
+  fingerprint of the parsed public key (`ECDsa.ExportSubjectPublicKeyInfo()`, hashed), not on the
+  configured `kid` string, was the deliberate choice: a relabeled `kid` reusing the same key material
+  would defeat a `kid`-based check, since `kid` is just a label a deployer controls, not a property of
+  the key itself. `SigningKeyOptionsValidatorTests.cs` proves both directions: it fails startup in
+  Production for the dev key, the test key, and the dev key under a different `kid`; it does not block
+  Development/Testing with the same keys, and does not block Production with an unrelated, valid key.
+- **`#TBD-17` (`GrantSigner` concurrency — QA follow-up).** `GrantSigner` was originally a singleton
+  holding one long-lived `ECDsa` instance, signed by every concurrent authorization request through that
+  same instance. .NET does not document `ECDsa`'s instance methods as safe for concurrent calls, so this
+  was fixed to build a fresh `ECDsa` (imported from the cached PEM text) inside every `Sign()` call
+  instead — cheap next to everything else one authorization request already does, and avoids a lock that
+  would serialize every concurrent request through one signing operation. This surfaced a real,
+  reproduced bug along the way: `Microsoft.IdentityModel`'s `CryptoProviderFactory` caches signature
+  providers by default, keyed by (roughly) the security key's `Kid` + algorithm, not by object identity —
+  since every call necessarily reuses the same `Kid` (it has to; `kid` is the stable, publishable
+  identifier a verifier looks up ahead of time), the default cache handed back a stale provider still
+  pointing at a *previous* call's already-disposed `ECDsa`, throwing `ObjectDisposedException` under
+  concurrent load. This is exactly why "trust `CryptoProviderFactory`'s caching to make concurrent
+  signing safe" (one of the options raised) would have been the wrong call — fixed by disabling the
+  cache for `GrantSigner`'s `SigningCredentials` (`CacheSignatureProviders = false` on a dedicated
+  factory), which sidesteps the stale-reference risk entirely since there is no cache left to go stale.
+  `GrantSignerTests.Sign_FromManyThreadsConcurrently_ProducesOnlyValidDistinctGrants` fires 100 concurrent
+  signing calls from the thread pool and verifies every resulting grant independently — this is also
+  exactly the test that caught the `CryptoProviderFactory` bug above, not a test written after the fact.
 - **Closed/Deceased cascade (decision #14) — T-016's `#TBD-5`, now resolved.** `CascadeMandateRevocation
   AndFreezeAsync` queries every `Active` mandate the customer holds, revokes each in the same
   `SaveChangesAsync` call as the customer's own status change, and queues one `AccountFreezeRequested`

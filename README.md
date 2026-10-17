@@ -151,6 +151,8 @@ KEY="idk_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"; echo "$KEY"; pr
 
 `appsettings.Development.json` also configures a **dev-only** ES256 (P-256) keypair under `SigningKeys`, clearly labeled, committed openly the same way the dev API key hashes above are. Unlike an API key, there's no "hash" equivalent for a signing key - the private key material itself has to be present to sign - so this is the actual key, never a real secret, never used outside this repository's own dev environment. The test suite uses its own, separate test-only keypair (`tests/.../Fixtures/TestSigningKey.cs`).
 
+**This key cannot be used in Production.** `SigningKeyOptionsValidator` fails startup (`ValidateOnStart`) if the app runs with `ASPNETCORE_ENVIRONMENT=Production` and either the dev key or the test key is configured - checked by the key's actual public-key material (`docs/DESIGN.md` Appendix C, `#TBD-16`), not by its `kid` label, so relabeling it doesn't slip past the check.
+
 `SigningKeys` is keyed by `kid` and shaped as a list from day one (`ActiveKid` plus `Keys`), so a second key can be added alongside the active one later for planned rotation (`docs/DESIGN.md` Section 4.3.1) without a breaking config change - this build only ever configures and uses one. Generate your own production keypair with:
 
 ```bash
