@@ -14,9 +14,15 @@ public class AuthorizationTests(ApiFixture fixture)
         """{"fullName":"Auth Test","jurisdictionCode":"NG","idempotencyKey":"auth-test-create-customer"}""";
     private static string KycDecisionBody() => """{"kycStatus":"Pending","verificationType":"BVN","provider":"test-provider"}""";
     private static string StatusChangeBody() => """{"reason":"auth test"}""";
+    private static string AttachMandateBody() => """{"ledgerAccountId":"ACC-AUTHZ-TEST","operations":["View"]}""";
+    private static string AuthorizationRequestBody() => """
+        {"requestedBy":"CUS-DOESNOTEXIST","operation":"Debit","debitAccountId":"ACC-1","creditAccountId":"ACC-2",
+         "amount":100,"currency":"NGN","idempotencyKey":"auth-scope-test"}
+        """;
 
     // Every endpoint with the one scope it requires. A non-existent customerId is fine: past
-    // authorization the controller/service answers with 404, not 401/403.
+    // authorization the controller/service answers with 404 (or, for authorization requests, 422), not
+    // 401/403.
     public static TheoryData<string, string, string?, string> Endpoints => new()
     {
         { "POST", "/v1/customers", CreateCustomerBody(), IdentityScopes.CustomerWrite },
@@ -26,6 +32,13 @@ public class AuthorizationTests(ApiFixture fixture)
         { "POST", "/v1/customers/CUS-DOESNOTEXIST/reactivate", StatusChangeBody(), IdentityScopes.CustomerWrite },
         { "POST", "/v1/customers/CUS-DOESNOTEXIST/close", StatusChangeBody(), IdentityScopes.CustomerWrite },
         { "POST", "/v1/customers/CUS-DOESNOTEXIST/mark-deceased", StatusChangeBody(), IdentityScopes.CustomerWrite },
+        { "POST", "/v1/customers/CUS-DOESNOTEXIST/mandates", AttachMandateBody(), IdentityScopes.MandateWrite },
+        { "GET", "/v1/customers/CUS-DOESNOTEXIST/mandates", null, IdentityScopes.MandateRead },
+        { "GET", "/v1/accounts/ACC-DOESNOTEXIST/mandates", null, IdentityScopes.MandateRead },
+        { "GET", "/v1/mandates/MND-DOESNOTEXIST", null, IdentityScopes.MandateRead },
+        { "POST", "/v1/mandates/MND-DOESNOTEXIST/revoke", StatusChangeBody(), IdentityScopes.MandateWrite },
+        { "POST", "/v1/authorization/requests", AuthorizationRequestBody(), IdentityScopes.AuthorizationCheck },
+        { "GET", "/v1/authorization/requests/DOES-NOT-EXIST", null, IdentityScopes.AuthorizationCheck },
     };
 
     private static HttpRequestMessage Request(string method, string path, string? body)
