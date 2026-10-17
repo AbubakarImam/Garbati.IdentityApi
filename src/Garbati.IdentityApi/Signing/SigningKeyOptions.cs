@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 
 namespace Garbati.IdentityApi.Signing;
@@ -30,7 +31,12 @@ public class SigningKeyEntry
 // endpoint (same rationale as ApiKeyOptionsValidator). Unlike ApiKeyOptions (zero clients is a valid,
 // if useless, configuration), at least one signing key is required - grant issuance cannot function
 // without one, so there is no equivalent "valid but empty" state here.
-public class SigningKeyOptionsValidator : IValidateOptions<SigningKeyOptions>
+//
+// Also enforces the owner's explicit condition on #TBD-15 (docs/DESIGN.md Appendix C): the dev/test
+// signing key material committed openly in this repository must never be configured in the Production
+// environment. IHostEnvironment is injected by DI the same way every other constructor dependency in
+// this codebase is - ASP.NET Core always registers it, so this needs no extra wiring in Program.cs.
+public class SigningKeyOptionsValidator(IHostEnvironment hostEnvironment) : IValidateOptions<SigningKeyOptions>
 {
     public ValidateOptionsResult Validate(string? name, SigningKeyOptions options)
     {
@@ -65,6 +71,14 @@ public class SigningKeyOptionsValidator : IValidateOptions<SigningKeyOptions>
                 if (ecdsa.KeySize != 256)
                 {
                     errors.Add($"SigningKeys:Keys '{key.Kid}' is not a P-256 (ES256) key.");
+                }
+                else if (hostEnvironment.IsProduction() && KnownInsecureSigningKeys.Fingerprints.Contains(KnownInsecureSigningKeys.Fingerprint(ecdsa)))
+                {
+                    // Compared by key MATERIAL (see KnownInsecureSigningKeys), not by this entry's Kid
+                    // label - relabeling Kid while reusing the same key would otherwise defeat the check.
+                    errors.Add(
+                        $"SigningKeys:Keys '{key.Kid}' is a known dev/test signing key and must not be " +
+                        "configured in the Production environment.");
                 }
             }
             catch (Exception)
