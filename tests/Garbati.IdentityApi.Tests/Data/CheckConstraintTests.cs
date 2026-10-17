@@ -1,3 +1,5 @@
+using Garbati.IdentityApi.Data;
+using Garbati.IdentityApi.Entities;
 using Garbati.IdentityApi.Tests.Fixtures;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
@@ -75,5 +77,108 @@ public class CheckConstraintTests(PostgresFixture fixture) : IAsyncLifetime
             """);
 
         Assert.Equal(4, await ctx.Customers.CountAsync());
+    }
+
+    private async Task<long> InsertCustomerAsync(IdentityDbContext ctx, string customerId)
+    {
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO customers (customer_id, customer_status, kyc_status, jurisdiction_code, idempotency_key, created_at, updated_at)
+            VALUES ({customerId}, 'Active', 'Pending', 'NG', {customerId}, now(), now())
+            """);
+        return await ctx.Customers.Where(c => c.CustomerId == customerId).Select(c => c.Id).SingleAsync();
+    }
+
+    [Fact]
+    public async Task Mandate_WithUnknownStatus_IsRejectedByTheDatabase()
+    {
+        await using var ctx = fixture.CreateContext();
+        var customerPk = await InsertCustomerAsync(ctx, "CUS-MANDATE-BADSTATUS");
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO mandates (mandate_id, customer_id, ledger_account_id, status, created_at, created_by)
+            VALUES ('MND-BADSTATUS', {customerPk}, 'ACC-1', 'Vanished', now(), 'test')
+            """));
+
+        Assert.Equal(PostgresErrorCodes.CheckViolation, ex.SqlState);
+        Assert.Equal("ck_mandates_status", ex.ConstraintName);
+    }
+
+    [Fact]
+    public async Task MandatePermission_WithUnknownOperation_IsRejectedByTheDatabase()
+    {
+        await using var ctx = fixture.CreateContext();
+        var customerPk = await InsertCustomerAsync(ctx, "CUS-MANDATE-BADOP");
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO mandates (mandate_id, customer_id, ledger_account_id, status, created_at, created_by)
+            VALUES ('MND-BADOP', {customerPk}, 'ACC-1', 'Active', now(), 'test')
+            """);
+        var mandatePk = await ctx.Mandates.Where(m => m.MandateId == "MND-BADOP").Select(m => m.Id).SingleAsync();
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO mandate_permissions (mandate_id, operation) VALUES ({mandatePk}, 'Transfer')
+            """));
+
+        Assert.Equal(PostgresErrorCodes.CheckViolation, ex.SqlState);
+        Assert.Equal("ck_mandate_permissions_operation", ex.ConstraintName);
+    }
+
+    // DESIGN.md Section 2.2/7.1/7.4, decision #19: the real constraint, not just application validation.
+    [Fact]
+    public async Task Mandate_SecondActiveMandateForTheSameCustomerAndAccount_IsRejectedByTheDatabase()
+    {
+        await using var ctx = fixture.CreateContext();
+        var customerPk = await InsertCustomerAsync(ctx, "CUS-MANDATE-DUP");
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO mandates (mandate_id, customer_id, ledger_account_id, status, created_at, created_by)
+            VALUES ('MND-DUP-1', {customerPk}, 'ACC-DUP', 'Active', now(), 'test')
+            """);
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO mandates (mandate_id, customer_id, ledger_account_id, status, created_at, created_by)
+            VALUES ('MND-DUP-2', {customerPk}, 'ACC-DUP', 'Active', now(), 'test')
+            """));
+
+        Assert.Equal(PostgresErrorCodes.UniqueViolation, ex.SqlState);
+        Assert.Equal("ix_mandates_customer_account_active", ex.ConstraintName);
+    }
+
+    // The partial index only covers Status = 'Active' - a second, REVOKED mandate for the same pair (a
+    // customer regaining access through a brand new mandate after an earlier one was revoked) must be
+    // allowed, and so must a second customer's own active mandate on the same account (joint accounts).
+    [Fact]
+    public async Task Mandate_SecondMandateForTheSamePair_IsAccepted_WhenTheFirstIsRevoked()
+    {
+        await using var ctx = fixture.CreateContext();
+        var customerPk = await InsertCustomerAsync(ctx, "CUS-MANDATE-REVOKED-THEN-NEW");
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO mandates (mandate_id, customer_id, ledger_account_id, status, created_at, created_by, revoked_at, revoked_by, revocation_reason)
+            VALUES ('MND-OLD', {customerPk}, 'ACC-REISSUE', 'Revoked', now(), 'test', now(), 'test', 'closed')
+            """);
+
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO mandates (mandate_id, customer_id, ledger_account_id, status, created_at, created_by)
+            VALUES ('MND-NEW', {customerPk}, 'ACC-REISSUE', 'Active', now(), 'test')
+            """);
+
+        Assert.Equal(2, await ctx.Mandates.CountAsync(m => m.LedgerAccountId == "ACC-REISSUE"));
+    }
+
+    [Fact]
+    public async Task Mandate_TwoDifferentCustomers_CanEachHoldAnActiveMandateOnTheSameAccount()
+    {
+        await using var ctx = fixture.CreateContext();
+        var customerAPk = await InsertCustomerAsync(ctx, "CUS-JOINT-A");
+        var customerBPk = await InsertCustomerAsync(ctx, "CUS-JOINT-B");
+
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO mandates (mandate_id, customer_id, ledger_account_id, status, created_at, created_by)
+            VALUES ('MND-JOINT-A', {customerAPk}, 'ACC-JOINT', 'Active', now(), 'test')
+            """);
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO mandates (mandate_id, customer_id, ledger_account_id, status, created_at, created_by)
+            VALUES ('MND-JOINT-B', {customerBPk}, 'ACC-JOINT', 'Active', now(), 'test')
+            """);
+
+        Assert.Equal(2, await ctx.Mandates.CountAsync(m => m.LedgerAccountId == "ACC-JOINT" && m.Status == MandateStatus.Active));
     }
 }

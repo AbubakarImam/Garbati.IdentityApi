@@ -14,6 +14,10 @@ public class IdentityDbContext(DbContextOptions<IdentityDbContext> options) : Db
     public DbSet<KycTierPolicy> KycTierPolicies => Set<KycTierPolicy>();
     public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>();
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
+    public DbSet<Mandate> Mandates => Set<Mandate>();
+    public DbSet<MandatePermission> MandatePermissions => Set<MandatePermission>();
+    public DbSet<MandateApprovalPolicy> MandateApprovalPolicies => Set<MandateApprovalPolicy>();
+    public DbSet<AuthorizationDecision> AuthorizationDecisions => Set<AuthorizationDecision>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -94,6 +98,59 @@ public class IdentityDbContext(DbContextOptions<IdentityDbContext> options) : Db
             entity.HasIndex(o => o.Status);
             entity.ToTable(t => t.HasCheckConstraint(
                 "ck_outbox_messages_status", "\"status\" IN ('Pending', 'Sent', 'Acknowledged', 'Failed')"));
+        });
+
+        // DESIGN.md Section 2.2/7.1/7.4, decision #19: the real constraint is the partial unique index
+        // below, not application-level validation alone. At most one ACTIVE mandate per (customer,
+        // account) - but different customers may each have their own active mandate on the same account
+        // (joint accounts, T-018). A plain unique index on (CustomerId, LedgerAccountId) would make that
+        // impossible, which is exactly the mistake Section 7.1 calls out by name.
+        modelBuilder.Entity<Mandate>(entity =>
+        {
+            entity.HasKey(m => m.Id);
+            entity.HasIndex(m => m.MandateId).IsUnique();
+            entity.HasIndex(m => new { m.CustomerId, m.LedgerAccountId })
+                .IsUnique()
+                .HasDatabaseName("ix_mandates_customer_account_active")
+                .HasFilter("\"status\" = 'Active'");
+            entity.HasIndex(m => m.LedgerAccountId);
+            entity.Property(m => m.Status).HasConversion<string>();
+            entity.ToTable(t => t.HasCheckConstraint(
+                "ck_mandates_status", "\"status\" IN ('Active', 'Revoked')"));
+
+            entity.HasOne(m => m.Customer)
+                .WithMany()
+                .HasForeignKey(m => m.CustomerId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<MandatePermission>(entity =>
+        {
+            entity.HasKey(p => p.Id);
+            entity.HasIndex(p => new { p.MandateId, p.Operation }).IsUnique();
+            entity.Property(p => p.Operation).HasConversion<string>();
+            entity.ToTable(t => t.HasCheckConstraint(
+                "ck_mandate_permissions_operation", "\"operation\" IN ('View', 'Debit', 'Credit')"));
+
+            entity.HasOne(p => p.Mandate)
+                .WithMany(m => m.Permissions)
+                .HasForeignKey(p => p.MandateId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // DESIGN.md Section 2.2a/7.1, decision #20: one row per LedgerAccountId, created alongside that
+        // account's first mandate (MandateService.AttachMandateAsync). RequiredApprovals defaults to 1 -
+        // T-017 never writes anything else (see the entity's own comment).
+        modelBuilder.Entity<MandateApprovalPolicy>(entity =>
+        {
+            entity.HasKey(p => p.Id);
+            entity.HasIndex(p => p.LedgerAccountId).IsUnique();
+        });
+
+        modelBuilder.Entity<AuthorizationDecision>(entity =>
+        {
+            entity.HasKey(d => d.Id);
+            entity.HasIndex(d => d.DecisionId).IsUnique();
         });
     }
 }

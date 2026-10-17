@@ -90,6 +90,84 @@ namespace Garbati.IdentityApi.Migrations
                     b.ToTable("audit_events", (string)null);
                 });
 
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.AuthorizationDecision", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("Amount")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("amount");
+
+                    b.Property<bool>("Approved")
+                        .HasColumnType("boolean")
+                        .HasColumnName("approved");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("CreditAccountId")
+                        .HasColumnType("text")
+                        .HasColumnName("credit_account_id");
+
+                    b.Property<string>("Currency")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("currency");
+
+                    b.Property<string>("DebitAccountId")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("debit_account_id");
+
+                    b.Property<string>("DecisionId")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("decision_id");
+
+                    b.Property<string>("DenialReason")
+                        .HasColumnType("text")
+                        .HasColumnName("denial_reason");
+
+                    b.Property<DateTimeOffset?>("GrantExpiresAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("grant_expires_at");
+
+                    b.Property<string>("IdempotencyKey")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("idempotency_key");
+
+                    b.Property<string>("MandateId")
+                        .HasColumnType("text")
+                        .HasColumnName("mandate_id");
+
+                    b.Property<string>("Operation")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("operation");
+
+                    b.Property<string>("RequestedBy")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("requested_by");
+
+                    b.HasKey("Id")
+                        .HasName("pk_authorization_decisions");
+
+                    b.HasIndex("DecisionId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_authorization_decisions_decision_id");
+
+                    b.ToTable("authorization_decisions", (string)null);
+                });
+
             modelBuilder.Entity("Garbati.IdentityApi.Entities.Customer", b =>
                 {
                     b.Property<long>("Id")
@@ -320,6 +398,147 @@ namespace Garbati.IdentityApi.Migrations
                         });
                 });
 
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.Mandate", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("CreatedBy")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("created_by");
+
+                    b.Property<long>("CustomerId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("customer_id");
+
+                    b.Property<string>("LedgerAccountId")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("ledger_account_id");
+
+                    b.Property<string>("MandateId")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("mandate_id");
+
+                    b.Property<string>("RevocationReason")
+                        .HasColumnType("text")
+                        .HasColumnName("revocation_reason");
+
+                    b.Property<DateTimeOffset?>("RevokedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("revoked_at");
+
+                    b.Property<string>("RevokedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("revoked_by");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("status");
+
+                    b.HasKey("Id")
+                        .HasName("pk_mandates");
+
+                    b.HasIndex("LedgerAccountId")
+                        .HasDatabaseName("ix_mandates_ledger_account_id");
+
+                    b.HasIndex("MandateId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_mandates_mandate_id");
+
+                    b.HasIndex("CustomerId", "LedgerAccountId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_mandates_customer_account_active")
+                        .HasFilter("\"status\" = 'Active'");
+
+                    b.ToTable("mandates", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_mandates_status", "\"status\" IN ('Active', 'Revoked')");
+                        });
+                });
+
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.MandateApprovalPolicy", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<DateTimeOffset>("LastChangedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("last_changed_at");
+
+                    b.Property<string>("LastChangedBy")
+                        .HasColumnType("text")
+                        .HasColumnName("last_changed_by");
+
+                    b.Property<string>("LedgerAccountId")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("ledger_account_id");
+
+                    b.Property<int>("RequiredApprovals")
+                        .HasColumnType("integer")
+                        .HasColumnName("required_approvals");
+
+                    b.HasKey("Id")
+                        .HasName("pk_mandate_approval_policies");
+
+                    b.HasIndex("LedgerAccountId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_mandate_approval_policies_ledger_account_id");
+
+                    b.ToTable("mandate_approval_policies", (string)null);
+                });
+
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.MandatePermission", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<long>("MandateId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("mandate_id");
+
+                    b.Property<string>("Operation")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("operation");
+
+                    b.HasKey("Id")
+                        .HasName("pk_mandate_permissions");
+
+                    b.HasIndex("MandateId", "Operation")
+                        .IsUnique()
+                        .HasDatabaseName("ix_mandate_permissions_mandate_id_operation");
+
+                    b.ToTable("mandate_permissions", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_mandate_permissions_operation", "\"operation\" IN ('View', 'Debit', 'Credit')");
+                        });
+                });
+
             modelBuilder.Entity("Garbati.IdentityApi.Entities.OutboxMessage", b =>
                 {
                     b.Property<long>("Id")
@@ -396,9 +615,38 @@ namespace Garbati.IdentityApi.Migrations
                     b.Navigation("Customer");
                 });
 
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.Mandate", b =>
+                {
+                    b.HasOne("Garbati.IdentityApi.Entities.Customer", "Customer")
+                        .WithMany()
+                        .HasForeignKey("CustomerId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired()
+                        .HasConstraintName("fk_mandates_customers_customer_id");
+
+                    b.Navigation("Customer");
+                });
+
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.MandatePermission", b =>
+                {
+                    b.HasOne("Garbati.IdentityApi.Entities.Mandate", "Mandate")
+                        .WithMany("Permissions")
+                        .HasForeignKey("MandateId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_mandate_permissions_mandates_mandate_id");
+
+                    b.Navigation("Mandate");
+                });
+
             modelBuilder.Entity("Garbati.IdentityApi.Entities.Customer", b =>
                 {
                     b.Navigation("IdentityData");
+                });
+
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.Mandate", b =>
+                {
+                    b.Navigation("Permissions");
                 });
 #pragma warning restore 612, 618
         }
