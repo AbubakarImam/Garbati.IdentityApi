@@ -3,6 +3,7 @@ using Garbati.IdentityApi.Authorization;
 using Garbati.IdentityApi.Data;
 using Garbati.IdentityApi.Middleware;
 using Garbati.IdentityApi.Services;
+using Garbati.IdentityApi.Signing;
 using Garbati.IdentityApi.Validation;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
@@ -57,6 +58,14 @@ try
         .ValidateOnStart();
     builder.Services.AddSingleton<IValidateOptions<ApiKeyOptions>, ApiKeyOptionsValidator>();
 
+    // Signing keys for the authorization grant (DESIGN.md Section 4.3.1/4.3.2, decisions #4/#26). See
+    // SigningKeyOptionsValidator for why - unlike ApiKeyOptions - at least one key is required.
+    builder.Services.AddOptions<SigningKeyOptions>()
+        .Bind(builder.Configuration.GetSection("SigningKeys"))
+        .ValidateOnStart();
+    builder.Services.AddSingleton<IValidateOptions<SigningKeyOptions>, SigningKeyOptionsValidator>();
+    builder.Services.AddSingleton<IGrantSigner, GrantSigner>();
+
     builder.Services.AddAuthentication(ApiKeyAuthenticationHandler.SchemeName)
         .AddScheme<AuthenticationSchemeOptions, ApiKeyAuthenticationHandler>(ApiKeyAuthenticationHandler.SchemeName, null);
 
@@ -82,11 +91,16 @@ try
         .AddDbContextCheck<IdentityDbContext>("database", tags: ["ready"]);
 
     builder.Services.AddScoped<ICustomerService, CustomerService>();
+    builder.Services.AddScoped<IMandateService, MandateService>();
+    builder.Services.AddScoped<ITransactionAuthorizationService, AuthorizationService>();
     builder.Services.AddScoped<IAuditLogger, AuditLogger>();
 
     builder.Services.AddScoped<CreateCustomerRequestValidator>();
     builder.Services.AddScoped<KycDecisionRequestValidator>();
     builder.Services.AddScoped<CustomerStatusChangeRequestValidator>();
+    builder.Services.AddScoped<AttachMandateRequestValidator>();
+    builder.Services.AddScoped<RevokeMandateRequestValidator>();
+    builder.Services.AddScoped<AuthorizationRequestValidator>();
 
     var app = builder.Build();
 
