@@ -14,9 +14,11 @@ namespace Garbati.IdentityApi.Controllers;
 [Route("v1/customers")]
 public class CustomersController(
     ICustomerService customerService,
+    IMandateService mandateService,
     CreateCustomerRequestValidator createCustomerRequestValidator,
     KycDecisionRequestValidator kycDecisionRequestValidator,
-    CustomerStatusChangeRequestValidator customerStatusChangeRequestValidator) : ControllerBase
+    CustomerStatusChangeRequestValidator customerStatusChangeRequestValidator,
+    AttachMandateRequestValidator attachMandateRequestValidator) : ControllerBase
 {
     [Authorize(Policy = IdentityScopes.CustomerWrite)]
     [HttpPost]
@@ -129,5 +131,34 @@ public class CustomersController(
 
         var customer = await customerService.MarkDeceasedAsync(customerId, request, cancellationToken);
         return Ok(customer);
+    }
+
+    // DESIGN.md Section 5.1/2.4 (T-017): "may be called more than once per account, once per holder, for
+    // a joint account" - this task only ever exercises the single-holder case, but the endpoint and the
+    // database constraint both already allow more.
+    [Authorize(Policy = IdentityScopes.MandateWrite)]
+    [HttpPost("{customerId}/mandates")]
+    public async Task<ActionResult<MandateResponse>> AttachMandate(
+        string customerId,
+        [FromBody] AttachMandateRequest request,
+        CancellationToken cancellationToken)
+    {
+        var errors = attachMandateRequestValidator.Validate(request);
+        if (errors.Count > 0)
+        {
+            return BadRequest(errors);
+        }
+
+        var mandate = await mandateService.AttachMandateAsync(customerId, request, cancellationToken);
+        return Ok(mandate);
+    }
+
+    [Authorize(Policy = IdentityScopes.MandateRead)]
+    [HttpGet("{customerId}/mandates")]
+    public async Task<ActionResult<IReadOnlyList<MandateResponse>>> ListMandatesForCustomer(
+        string customerId, CancellationToken cancellationToken)
+    {
+        var mandates = await mandateService.ListMandatesForCustomerAsync(customerId, cancellationToken);
+        return Ok(mandates);
     }
 }

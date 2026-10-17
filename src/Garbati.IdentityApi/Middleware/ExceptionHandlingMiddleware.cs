@@ -26,19 +26,28 @@ public class ExceptionHandlingMiddleware(RequestDelegate next, ILogger<Exception
                 logger.LogError(ex, "Unhandled exception processing {Method} {Path}", context.Request.Method, context.Request.Path);
 
             context.Response.StatusCode = status;
+
+            var problem = new ProblemDetails
+            {
+                Status = status,
+                Title = title,
+                // Only expected business errors expose their message; unexpected ones must not leak internals.
+                Detail = isExpected ? ex.Message : null,
+                // Lets a client quote the id when reporting a problem; it matches the logs and audit rows.
+                Extensions = { ["correlationId"] = context.TraceIdentifier }
+            };
+
+            // DESIGN.md Section 5.1: a denial carries a stable reason code and the decision id (already
+            // persisted by AuthorizationService before this was thrown) - never the signed grant, which
+            // was never issued on this path.
+            if (ex is AuthorizationDeniedException authorizationDenied)
+            {
+                problem.Extensions["decisionId"] = authorizationDenied.DecisionId;
+                problem.Extensions["reasonCode"] = authorizationDenied.ReasonCode;
+            }
+
             // contentType is passed explicitly: WriteAsJsonAsync would otherwise overwrite it with application/json.
-            await context.Response.WriteAsJsonAsync(
-                new ProblemDetails
-                {
-                    Status = status,
-                    Title = title,
-                    // Only expected business errors expose their message; unexpected ones must not leak internals.
-                    Detail = isExpected ? ex.Message : null,
-                    // Lets a client quote the id when reporting a problem; it matches the logs and audit rows.
-                    Extensions = { ["correlationId"] = context.TraceIdentifier }
-                },
-                options: null,
-                contentType: "application/problem+json");
+            await context.Response.WriteAsJsonAsync(problem, options: null, contentType: "application/problem+json");
         }
     }
 
@@ -47,8 +56,11 @@ public class ExceptionHandlingMiddleware(RequestDelegate next, ILogger<Exception
     private static (int Status, string Title) Map(Exception ex) => ex switch
     {
         CustomerNotFoundException => (StatusCodes.Status404NotFound, "Customer not found."),
+        MandateNotFoundException => (StatusCodes.Status404NotFound, "Mandate not found."),
         InvalidCustomerStatusTransitionException => (StatusCodes.Status409Conflict, "Customer status transition not allowed."),
         DuplicateIdempotencyKeyException => (StatusCodes.Status409Conflict, "Duplicate idempotency key."),
+        DuplicateActiveMandateException => (StatusCodes.Status409Conflict, "Customer already has an active mandate on this account."),
+        AuthorizationDeniedException => (StatusCodes.Status422UnprocessableEntity, "Authorization denied."),
         _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred.")
     };
 }
