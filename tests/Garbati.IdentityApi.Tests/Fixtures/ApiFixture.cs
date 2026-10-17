@@ -36,6 +36,10 @@ public class ApiFixture : IAsyncLifetime
             ["Serilog:MinimumLevel:Default"] = "Warning",
             // The Testing environment is not Development, so this exercises the showcase switch.
             ["Swagger:Enabled"] = "true",
+            // Test-only ES256 key (TestSigningKey) - never the dev key from appsettings.Development.json.
+            ["SigningKeys:ActiveKid"] = TestSigningKey.Kid,
+            ["SigningKeys:Keys:0:Kid"] = TestSigningKey.Kid,
+            ["SigningKeys:Keys:0:PrivateKeyPem"] = TestSigningKey.PrivateKeyPem,
         };
 
         var clients = IdentityScopes.All

@@ -12,8 +12,37 @@ public class CustomersControllerTests
     private static readonly CustomerResponse Customer = new(
         "CUS-ABCDEFGHJKLMNPQ", null, "Active", "Pending", null, "NG", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
 
+    private static readonly MandateResponse Mandate = new(
+        "MND-ABCDEFGHJKLMNPQ", "CUS-ABCDEFGHJKLMNPQ", "ACC-1", "Active", ["View"],
+        DateTimeOffset.UtcNow, "test-client", null, null, null);
+
     private static CreateCustomerRequest ValidCreateRequest(string fullName = "Ada Lovelace") =>
         new(fullName, "NG", null, null, null, "controller-test-key");
+
+    // Minimal stand-in for IMandateService, parallel to StubCustomerService below - only what
+    // CustomersController's two mandate actions need (same approach as LedgerApi's stub services).
+    private sealed class StubMandateService(MandateResponse mandate) : IMandateService
+    {
+        public int AttachCalls { get; private set; }
+
+        public Task<MandateResponse> AttachMandateAsync(string customerId, AttachMandateRequest request, CancellationToken cancellationToken = default)
+        {
+            AttachCalls++;
+            return Task.FromResult(mandate);
+        }
+
+        public Task<IReadOnlyList<MandateResponse>> ListMandatesForCustomerAsync(string customerId, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<MandateResponse>>([mandate]);
+
+        public Task<IReadOnlyList<MandateResponse>> ListActiveHoldersForAccountAsync(string ledgerAccountId, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<MandateResponse>>([mandate]);
+
+        public Task<MandateResponse?> GetMandateAsync(string mandateId, CancellationToken cancellationToken = default) =>
+            Task.FromResult<MandateResponse?>(mandate);
+
+        public Task<MandateResponse> RevokeMandateAsync(string mandateId, RevokeMandateRequest request, CancellationToken cancellationToken = default) =>
+            Task.FromResult(mandate);
+    }
 
     // Returns a fixed result (or null for "not found") and counts calls, so the controller's validation
     // and not-found mapping can be tested without a database (same approach as LedgerApi's
@@ -63,11 +92,13 @@ public class CustomersControllerTests
         }
     }
 
-    private static CustomersController CreateController(StubCustomerService service) => new(
+    private static CustomersController CreateController(StubCustomerService service, StubMandateService? mandateService = null) => new(
         service,
+        mandateService ?? new StubMandateService(Mandate),
         new CreateCustomerRequestValidator(),
         new KycDecisionRequestValidator(),
-        new CustomerStatusChangeRequestValidator());
+        new CustomerStatusChangeRequestValidator(),
+        new AttachMandateRequestValidator());
 
     [Fact]
     public async Task CreateCustomer_Returns200_WithTheCreatedCustomer()
@@ -262,5 +293,46 @@ public class CustomersControllerTests
         var errors = Assert.IsAssignableFrom<IReadOnlyList<string>>(badRequest.Value);
         Assert.Contains(errors, e => e.Contains("Reason"));
         Assert.Equal(0, service.MarkDeceasedCalls);
+    }
+
+    [Fact]
+    public async Task AttachMandate_Returns200_WithAValidRequest()
+    {
+        var mandateService = new StubMandateService(Mandate);
+        var controller = CreateController(new StubCustomerService(Customer), mandateService);
+
+        var result = await controller.AttachMandate(
+            "CUS-ABCDEFGHJKLMNPQ", new AttachMandateRequest("ACC-1", ["View"]), CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result.Result);
+        Assert.Equal(Mandate, ok.Value);
+        Assert.Equal(1, mandateService.AttachCalls);
+    }
+
+    [Fact]
+    public async Task AttachMandate_Returns400_AndDoesNotCallTheService_WhenOperationIsUnrecognized()
+    {
+        var mandateService = new StubMandateService(Mandate);
+        var controller = CreateController(new StubCustomerService(Customer), mandateService);
+
+        var result = await controller.AttachMandate(
+            "CUS-ABCDEFGHJKLMNPQ", new AttachMandateRequest("ACC-1", ["NotARealOperation"]), CancellationToken.None);
+
+        var badRequest = Assert.IsType<BadRequestObjectResult>(result.Result);
+        var errors = Assert.IsAssignableFrom<IReadOnlyList<string>>(badRequest.Value);
+        Assert.Contains(errors, e => e.Contains("Operation"));
+        Assert.Equal(0, mandateService.AttachCalls);
+    }
+
+    [Fact]
+    public async Task ListMandatesForCustomer_Returns200()
+    {
+        var controller = CreateController(new StubCustomerService(Customer));
+
+        var result = await controller.ListMandatesForCustomer("CUS-ABCDEFGHJKLMNPQ", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result.Result);
+        var mandates = Assert.IsAssignableFrom<IReadOnlyList<MandateResponse>>(ok.Value);
+        Assert.Equal([Mandate], mandates);
     }
 }

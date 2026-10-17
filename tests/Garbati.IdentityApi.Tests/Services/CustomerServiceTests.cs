@@ -1,4 +1,6 @@
+using System.Text.Json;
 using Garbati.IdentityApi.Auditing;
+using Garbati.IdentityApi.Contracts.Outbox;
 using Garbati.IdentityApi.Contracts.Requests;
 using Garbati.IdentityApi.Contracts.Responses;
 using Garbati.IdentityApi.Entities;
@@ -328,11 +330,13 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
                 .MarkDeceasedAsync(customerId, new CustomerStatusChangeRequest("second notice")));
     }
 
-    // The task file is explicit: T-016 must not fake a mandate lookup. This test documents today's real
-    // behaviour (no OutboxMessage row) so it fails loudly, as a reminder, the day T-017 wires the cascade
-    // in and this test needs to be updated alongside it rather than silently going stale.
+    // T-016 left this test asserting zero outbox rows, specifically because Mandates didn't exist yet -
+    // and specifically written to force T-017 to come back and update it once they do (see its original
+    // comment in the T-016 PR). This is that update: a customer with no mandates at all still writes
+    // nothing, which is still real (not faked) behaviour, just no longer the *only* behaviour this path
+    // can produce - see the tests below for the cases that now write something.
     [Fact]
-    public async Task CloseCustomerAsync_WritesNoOutboxMessage_BecauseMandatesDoNotExistYet()
+    public async Task CloseCustomerAsync_WritesNoOutboxMessage_WhenTheCustomerHasNoMandates()
     {
         var customerId = await CreateCustomerAsync();
 
@@ -342,6 +346,96 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
 
         await using var verifyCtx = fixture.CreateContext();
         Assert.Equal(0, await verifyCtx.OutboxMessages.CountAsync());
+    }
+
+    // DESIGN.md Section 2.1/2.5, decision #14, now wired up for real (T-017): closing a customer who was
+    // the SOLE active holder of an account revokes their mandate and queues exactly one freeze message
+    // naming that account.
+    [Fact]
+    public async Task CloseCustomerAsync_RevokesTheMandate_AndQueuesOneFreeze_WhenTheCustomerWasTheSoleHolder()
+    {
+        var customerId = await CreateCustomerAsync();
+        await using (var attachCtx = fixture.CreateContext())
+        {
+            await new MandateService(attachCtx, TestAudit.For(attachCtx), TestCaller.Default)
+                .AttachMandateAsync(customerId, new AttachMandateRequest("ACC-SOLE-HOLDER", ["Debit"]));
+        }
+
+        await using var ctx = fixture.CreateContext();
+        await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .CloseCustomerAsync(customerId, new CustomerStatusChangeRequest("customer requested closure"));
+
+        await using var verifyCtx = fixture.CreateContext();
+        var mandate = await verifyCtx.Mandates.SingleAsync(m => m.LedgerAccountId == "ACC-SOLE-HOLDER");
+        Assert.Equal(MandateStatus.Revoked, mandate.Status);
+        Assert.NotNull(mandate.RevokedAt);
+
+        var outboxMessage = await verifyCtx.OutboxMessages.SingleAsync();
+        Assert.Equal(OutboxMessageTypes.AccountFreezeRequested, outboxMessage.MessageType);
+        var payload = JsonSerializer.Deserialize<AccountFreezeRequestedPayload>(outboxMessage.Payload)!;
+        Assert.Equal("ACC-SOLE-HOLDER", payload.LedgerAccountId);
+        Assert.Equal(customerId, payload.CustomerId);
+    }
+
+    // A joint account with a surviving active holder is NOT frozen (DESIGN.md Section 2.1's table) -
+    // only the closed customer's own mandate is revoked.
+    [Fact]
+    public async Task CloseCustomerAsync_RevokesOnlyItsOwnMandate_AndQueuesNoFreeze_WhenAnotherHolderStaysActive()
+    {
+        var closingCustomerId = await CreateCustomerAsync();
+
+        string otherCustomerId;
+        await using (var otherCtx = fixture.CreateContext())
+        {
+            var response = await new CustomerService(otherCtx, TestAudit.For(otherCtx), new TestCaller("other-client"))
+                .CreateCustomerAsync(NewCustomerRequest(fullName: "Grace Hopper", idempotencyKey: Guid.NewGuid().ToString()));
+            otherCustomerId = response.CustomerId;
+        }
+
+        await using (var attachCtx = fixture.CreateContext())
+        {
+            var mandateService = new MandateService(attachCtx, TestAudit.For(attachCtx), TestCaller.Default);
+            await mandateService.AttachMandateAsync(closingCustomerId, new AttachMandateRequest("ACC-JOINT-HOLDER", ["Debit"]));
+            await mandateService.AttachMandateAsync(otherCustomerId, new AttachMandateRequest("ACC-JOINT-HOLDER", ["Debit"]));
+        }
+
+        await using var ctx = fixture.CreateContext();
+        await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .CloseCustomerAsync(closingCustomerId, new CustomerStatusChangeRequest("customer requested closure"));
+
+        await using var verifyCtx = fixture.CreateContext();
+        var closingCustomerPk = await verifyCtx.Customers.Where(c => c.CustomerId == closingCustomerId).Select(c => c.Id).SingleAsync();
+        var otherCustomerPk = await verifyCtx.Customers.Where(c => c.CustomerId == otherCustomerId).Select(c => c.Id).SingleAsync();
+
+        var closedCustomerMandate = await verifyCtx.Mandates.SingleAsync(
+            m => m.LedgerAccountId == "ACC-JOINT-HOLDER" && m.CustomerId == closingCustomerPk);
+        Assert.Equal(MandateStatus.Revoked, closedCustomerMandate.Status);
+
+        var otherCustomerMandate = await verifyCtx.Mandates.SingleAsync(
+            m => m.LedgerAccountId == "ACC-JOINT-HOLDER" && m.CustomerId == otherCustomerPk);
+        Assert.Equal(MandateStatus.Active, otherCustomerMandate.Status);
+
+        Assert.Equal(0, await verifyCtx.OutboxMessages.CountAsync());
+    }
+
+    [Fact]
+    public async Task MarkDeceasedAsync_RevokesTheMandate_AndQueuesOneFreeze_WhenTheCustomerWasTheSoleHolder()
+    {
+        var customerId = await CreateCustomerAsync();
+        await using (var attachCtx = fixture.CreateContext())
+        {
+            await new MandateService(attachCtx, TestAudit.For(attachCtx), TestCaller.Default)
+                .AttachMandateAsync(customerId, new AttachMandateRequest("ACC-DECEASED-SOLE", ["Debit"]));
+        }
+
+        await using var ctx = fixture.CreateContext();
+        await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .MarkDeceasedAsync(customerId, new CustomerStatusChangeRequest("death certificate received"));
+
+        await using var verifyCtx = fixture.CreateContext();
+        var mandate = await verifyCtx.Mandates.SingleAsync(m => m.LedgerAccountId == "ACC-DECEASED-SOLE");
+        Assert.Equal(MandateStatus.Revoked, mandate.Status);
+        Assert.Equal(1, await verifyCtx.OutboxMessages.CountAsync(o => o.MessageType == OutboxMessageTypes.AccountFreezeRequested));
     }
 
     [Theory]

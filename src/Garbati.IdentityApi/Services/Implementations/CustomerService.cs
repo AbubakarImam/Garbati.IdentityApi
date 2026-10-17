@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using Garbati.IdentityApi.Auditing;
 using Garbati.IdentityApi.Authorization;
+using Garbati.IdentityApi.Contracts.Outbox;
 using Garbati.IdentityApi.Contracts.Requests;
 using Garbati.IdentityApi.Contracts.Responses;
 using Garbati.IdentityApi.Data;
@@ -264,27 +265,83 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
         return ToResponse(customer);
     }
 
-    // DESIGN.md Section 2.1, decision #14: becoming Closed or Deceased should revoke every mandate this
-    // customer holds, and queue a freeze (an OutboxMessages row, Section 2.5) for every ledger account
-    // where it was their only active mandate.
+    // DESIGN.md Section 2.1, decision #14: becoming Closed or Deceased revokes every mandate this
+    // customer holds, and queues a freeze (an OutboxMessages row, Section 2.5) for every ledger account
+    // where it was their only active mandate. T-016 left this as a documented no-op because Mandates
+    // didn't exist yet; T-017 (this task) wires it up for real now that they do.
     //
-    // T-016 (this task) deliberately does not build Mandates - that is T-017's job (see the task file's
-    // explicit scope boundary). There is therefore nothing to query here yet: no mandates exist to
-    // revoke, and so no OutboxMessage is written on this path today. This is a documented gap, not an
-    // oversight - the task file explicitly forbids inventing a fake mandate check to make this look more
-    // finished than it is.
-    //
-    // T-017 MUST come back to this exact method and:
-    //   1. Query every Active Mandate held by this customer; set each to Revoked (RevokedAt/RevokedBy/
-    //      RevocationReason) in the same database transaction as the status change above.
-    //   2. For every distinct LedgerAccountId among those mandates, check whether any OTHER customer
-    //      still holds an Active mandate on it. If not, this customer was its only active holder: add an
-    //      OutboxMessage (MessageType = OutboxMessageTypes.AccountFreezeRequested, Payload = the
-    //      serialized shape of Contracts.Outbox.AccountFreezeRequestedPayload) so the Orchestrator can
-    //      carry out the actual freeze (IdentityApi never calls LedgerApi to change state - Section 2.5).
-    //   3. A joint account with a surviving active holder must NOT get a freeze message (Section 2.1).
-    private Task CascadeMandateRevocationAndFreezeAsync(Customer customer, string? reason, CancellationToken cancellationToken) =>
-        Task.CompletedTask;
+    // Everything below is staged on the same dbContext as the status change in ChangeStatusAsync and
+    // commits (or rolls back) together with it in that method's single SaveChangesAsync call - there is
+    // no separate transaction here.
+    private async Task CascadeMandateRevocationAndFreezeAsync(Customer customer, string? reason, CancellationToken cancellationToken)
+    {
+        var activeMandates = await dbContext.Mandates
+            .Where(m => m.CustomerId == customer.Id && m.Status == MandateStatus.Active)
+            .ToListAsync(cancellationToken);
+
+        if (activeMandates.Count == 0)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var actor = currentClient.ClientId ?? "system";
+        var cascadeReason = reason is null
+            ? $"Cascaded from customer status change to {customer.CustomerStatus}."
+            : $"Cascaded from customer status change to {customer.CustomerStatus}: {reason}";
+
+        foreach (var mandate in activeMandates)
+        {
+            mandate.Status = MandateStatus.Revoked;
+            mandate.RevokedAt = now;
+            mandate.RevokedBy = actor;
+            mandate.RevocationReason = cascadeReason;
+
+            auditLogger.Record(new AuditEvent
+            {
+                Action = AuditActions.MandateRevoked,
+                EntityType = nameof(Mandate),
+                EntityId = mandate.MandateId,
+                Status = mandate.Status.ToString(),
+                Details = cascadeReason,
+            });
+        }
+
+        // One freeze check per distinct account, not per mandate - a customer could in principle hold
+        // more than one mandate on the same account only if earlier data allowed it, but either way the
+        // "does anyone else still hold this account" question only needs asking once per account.
+        foreach (var ledgerAccountId in activeMandates.Select(m => m.LedgerAccountId).Distinct())
+        {
+            var otherHolderStillActive = await dbContext.Mandates.AnyAsync(
+                m => m.LedgerAccountId == ledgerAccountId && m.Status == MandateStatus.Active && m.CustomerId != customer.Id,
+                cancellationToken);
+
+            // A joint account with a surviving active holder is NOT frozen (DESIGN.md Section 2.1's
+            // table) - only this customer's own mandate was revoked above.
+            if (otherHolderStillActive)
+            {
+                continue;
+            }
+
+            var payload = new AccountFreezeRequestedPayload(ledgerAccountId, customer.CustomerId, cascadeReason, now);
+            dbContext.OutboxMessages.Add(new OutboxMessage
+            {
+                MessageType = OutboxMessageTypes.AccountFreezeRequested,
+                Payload = JsonSerializer.Serialize(payload),
+                Status = OutboxMessageStatus.Pending,
+                CreatedAt = now,
+            });
+
+            auditLogger.Record(new AuditEvent
+            {
+                Action = AuditActions.AccountFreezeRequested,
+                EntityType = nameof(OutboxMessage),
+                EntityId = ledgerAccountId,
+                Status = OutboxMessageStatus.Pending.ToString(),
+                Details = cascadeReason,
+            });
+        }
+    }
 
     private async Task<Customer> GetTrackedCustomerOrThrowAsync(string customerId, CancellationToken cancellationToken)
     {

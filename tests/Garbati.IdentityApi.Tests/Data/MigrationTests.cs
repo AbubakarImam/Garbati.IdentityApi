@@ -19,6 +19,7 @@ public class MigrationTests(PostgresFixture fixture)
         Assert.Contains(applied, m => m.EndsWith("InitialCreate"));
         Assert.Contains(applied, m => m.EndsWith("SeedPlaceholderKycTierPolicies"));
         Assert.Contains(applied, m => m.EndsWith("AddIdempotencyToCustomers"));
+        Assert.Contains(applied, m => m.EndsWith("AddMandatesAndAuthorization"));
     }
 
     [Fact]
@@ -48,6 +49,20 @@ public class MigrationTests(PostgresFixture fixture)
 
         await AssertColumnsAsync(ctx, "outbox_messages",
             "id", "message_type", "payload", "status", "attempt_count", "last_error", "created_at", "processed_at");
+
+        await AssertColumnsAsync(ctx, "mandates",
+            "id", "mandate_id", "customer_id", "ledger_account_id", "status", "created_at", "created_by",
+            "revoked_at", "revoked_by", "revocation_reason");
+
+        await AssertColumnsAsync(ctx, "mandate_permissions", "id", "mandate_id", "operation");
+
+        await AssertColumnsAsync(ctx, "mandate_approval_policies",
+            "id", "ledger_account_id", "required_approvals", "created_at", "last_changed_at", "last_changed_by");
+
+        await AssertColumnsAsync(ctx, "authorization_decisions",
+            "id", "decision_id", "requested_by", "operation", "debit_account_id", "credit_account_id",
+            "amount", "currency", "idempotency_key", "mandate_id", "approved", "denial_reason",
+            "created_at", "grant_expires_at");
     }
 
     [Fact]
