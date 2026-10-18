@@ -16,4 +16,13 @@ public static class AuditActions
     public const string AccountFreezeRequested = "AccountFreezeRequested";
     public const string AuthorizationApproved = "AuthorizationApproved";
     public const string AuthorizationDenied = "AuthorizationDenied";
+
+    // T-018 additions (DESIGN.md Section 6.3: "every PendingApprovalRequest lifecycle event: created,
+    // each approval given, voided (and why), expired, approved/grant issued" plus "every threshold-change
+    // request and its outcome"). One set of actions covers both Kind values; Details distinguishes.
+    public const string PendingApprovalRequestCreated = "PendingApprovalRequestCreated";
+    public const string ApprovalGiven = "ApprovalGiven";
+    public const string ApprovalVoided = "ApprovalVoided";
+    public const string PendingApprovalRequestExpired = "PendingApprovalRequestExpired";
+    public const string PendingApprovalRequestResolved = "PendingApprovalRequestResolved";
 }

@@ -46,6 +46,13 @@ public class ExceptionHandlingMiddleware(RequestDelegate next, ILogger<Exception
                 problem.Extensions["reasonCode"] = authorizationDenied.ReasonCode;
             }
 
+            // T-018: the same stable-reason-code contract, for a denial that has no decisionId because no
+            // AuthorizationDecision was ever created (see JointApprovalDeniedException's own comment).
+            if (ex is JointApprovalDeniedException jointApprovalDenied)
+            {
+                problem.Extensions["reasonCode"] = jointApprovalDenied.ReasonCode;
+            }
+
             // contentType is passed explicitly: WriteAsJsonAsync would otherwise overwrite it with application/json.
             await context.Response.WriteAsJsonAsync(problem, options: null, contentType: "application/problem+json");
         }
@@ -61,6 +68,14 @@ public class ExceptionHandlingMiddleware(RequestDelegate next, ILogger<Exception
         DuplicateIdempotencyKeyException => (StatusCodes.Status409Conflict, "Duplicate idempotency key."),
         DuplicateActiveMandateException => (StatusCodes.Status409Conflict, "Customer already has an active mandate on this account."),
         AuthorizationDeniedException => (StatusCodes.Status422UnprocessableEntity, "Authorization denied."),
+
+        // T-018 additions (DESIGN.md Section 3.8).
+        PendingApprovalRequestNotFoundException => (StatusCodes.Status404NotFound, "Pending approval request not found."),
+        ApprovalPolicyNotFoundException => (StatusCodes.Status404NotFound, "Approval policy not found."),
+        PendingApprovalRequestNotPendingException => (StatusCodes.Status409Conflict, "Pending approval request is not open for approval."),
+        DuplicateApprovalException => (StatusCodes.Status409Conflict, "This holder has already approved this request."),
+        InvalidApprovalThresholdException => (StatusCodes.Status400BadRequest, "Invalid RequiredApprovals value."),
+        JointApprovalDeniedException => (StatusCodes.Status422UnprocessableEntity, "Joint approval denied."),
         _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred.")
     };
 }
