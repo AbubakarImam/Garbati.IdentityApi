@@ -586,6 +586,7 @@ Numbering continues from the original v1 draft (1–18). New v2 decisions are 19
 | 33 | Reversal grant shape | A reversal-specific token/grant shape; reuse the existing grant machinery with a new `operation` value | **Confirmed, 18 Oct 2026: reuse**, unchanged `GrantSigner`/claim/expiry/signing logic, `operation: "Reversal"` plus the reason code as an added claim. See 8.5. |
 | 34 | Reversal outcome / write-off tracking | No tracking in IdentityApi (leave fully to ops tooling); track a distinct write-off event | **Confirmed, 18 Oct 2026: track it** — new `ReversalOutcomes` entity (`AuthorizationDecisionId`, `Outcome` `Completed`/`WriteOff`, `RecordedAt`, `RecordedBy`, `Notes`), a thin audit record of the recovery decision's conclusion, not the recovery process itself. The owner chose this over the research's more conservative "fully out of scope" recommendation. See 8.6. |
 | 35 | Reversal response-time enforcement | Reject a reversal request past some age limit; no code enforcement | **Confirmed, 18 Oct 2026: no code enforcement.** Timestamps are recorded exactly as for any other authorization decision; any real SLA is an ops-process target measured against them, not an IdentityApi rule. See 8.7. |
+| 36 | Persisting ReasonCode on AuthorizationDecision | Leave it only in the signed grant (never persisted, decision #13) and the audit Details string; add a dedicated column | **Confirmed, 18 Oct 2026 (T-020 build, #TBD-31): a dedicated column.** Without it, a reversal's reason code becomes unrecoverable the moment its 30-second grant expires — a worse trade than one small, low-risk, additive schema change, given Section 6.3 already lists this as something that must be auditable. |
 
 ---
 
@@ -972,13 +973,14 @@ migration (`AddReversalAuthorization`) and migration/check-constraint tests mirr
   state for this action" convention `PendingApprovalRequestNotPendingException` already established. A
   second outcome on an already-recorded decision → 409 (`DuplicateReversalOutcomeException`), per the task
   file's own instruction, matching `Mandates`/`Customer`'s `Closed`-style "terminal state" convention.
-- **`#TBD-31` (persisting `ReasonCode` on `AuthorizationDecision`, Section 8.5/8.6).** Decision #33 only
-  requires the reason code as a *grant claim* - it does not say to persist it on the `AuthorizationDecision`
-  row too. T-020 added the column anyway: the grant itself is never logged or persisted (decision #13), so
-  without this column the reason code would become permanently unrecoverable the moment the 30-second
-  grant expires, which seemed like the wrong trade for a field Section 6.3 lists among what gets audited.
-  Low-risk, additive, nullable for every non-`Reversal` decision; flagged in case the owner would rather
-  this live only in the audit `Details` string.
+- **`#TBD-31` — resolved by decision #36 (Section 9).** Decision #33 only requires the reason code as a
+  *grant claim* - it does not say to persist it on the `AuthorizationDecision` row too. T-020 added the
+  column anyway and flagged it as an open judgment call rather than a silent addition: the grant itself is
+  never logged or persisted (decision #13), so without this column the reason code would become
+  permanently unrecoverable the moment the 30-second grant expires, which seemed like the wrong trade for a
+  field Section 6.3 lists among what gets audited. The owner has since confirmed a dedicated column is
+  correct (decision #36) over the alternative of leaving it only in the grant and the audit `Details`
+  string. Low-risk, additive, nullable for every non-`Reversal` decision.
 - **`#TBD-32` (one audit event, not two, for a granted reversal, Section 6.3).** Section 6.3 lists "a
   reversal authorization requested, the resulting grant issued or the denial" as things to audit, which
   could read as two separate events per reversal. T-020 records exactly one (`AuditActions.
