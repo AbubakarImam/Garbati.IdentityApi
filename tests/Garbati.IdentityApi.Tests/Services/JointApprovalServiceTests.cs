@@ -1,5 +1,6 @@
 using Garbati.IdentityApi.Auditing;
 using Garbati.IdentityApi.Contracts.Requests;
+using Garbati.IdentityApi.Contracts.Responses;
 using Garbati.IdentityApi.Entities;
 using Garbati.IdentityApi.Exceptions;
 using Garbati.IdentityApi.Services;
@@ -664,5 +665,144 @@ public class JointApprovalServiceTests(PostgresFixture fixture) : IAsyncLifetime
         Assert.Equal("Approved", getResponse!.Status);
         Assert.NotNull(getResponse.DecisionId);
         Assert.Null(getResponse.Grant);
+    }
+
+    // --- QA follow-up (Blocker): concurrent final approvals ------------------------------------------
+    //
+    // Reproduces QA's exact scenario: a 2-of-3 account with 1 approval already on file (the requester's
+    // own), then two DIFFERENT holders racing to submit what each believes is the completing approval at
+    // the same moment. Without the row lock in ApproveAsync, both would independently observe the
+    // pre-existing count, both add their own approval, both conclude the threshold is met, and both run
+    // the completion logic - two AuthorizationDecision rows and two valid signed grants for one request.
+    //
+    // Mirrors CustomerServiceTests.CreateCustomerAsync_ConcurrentRequestsWithOneKeyAndDifferentBodies_
+    // OneSucceedsOneConflicts's style: Task.Run per attempt, each on its OWN separate DbContext (a real
+    // DbContext is not safe for concurrent use, and a shared one would not exercise two real concurrent
+    // database transactions the way two real concurrent HTTP requests - each with their own scoped
+    // DbContext - actually would).
+    [Fact]
+    public async Task ApproveAsync_ConcurrentFinalApprovals_ProducesExactlyOneGrant_NotTwo()
+    {
+        var customerA = await CreateCustomerAsync("Holder A");
+        var customerB = await CreateCustomerAsync("Holder B");
+        var customerC = await CreateCustomerAsync("Holder C");
+        await AttachMandateAsync(customerA, "ACC-RACE", "Debit");
+        await AttachMandateAsync(customerB, "ACC-RACE", "Debit");
+        await AttachMandateAsync(customerC, "ACC-RACE", "Debit");
+        await SetRequiredApprovalsAsync("ACC-RACE", 2, customerA, customerB, customerC);
+
+        string requestId;
+        await using (var ctx = fixture.CreateContext())
+        {
+            // A's own approval (1 of 2 required) is already on file - B and C now race for the 2nd.
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, "ACC-RACE"));
+            requestId = Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId;
+        }
+
+        var attempts = new[] { customerB, customerC }.Select(holder => Task.Run(async () =>
+        {
+            await using var ctx = fixture.CreateContext();
+            try
+            {
+                var response = await CreateJointApprovalService(ctx).ApproveAsync(requestId, new ApproveRequest(holder));
+                return (Outcome: "approved", Response: response, Error: (Exception?)null);
+            }
+            catch (PendingApprovalRequestNotPendingException ex)
+            {
+                // The "clean conflict response" the task's own fix guidance asks for: unblocked only
+                // after the winner already committed, this holder's own call correctly sees the request
+                // is no longer Pending, rather than racing its way to a second grant.
+                return (Outcome: "conflict", Response: (PendingApprovalRequestResponse?)null, Error: (Exception?)ex);
+            }
+        }));
+
+        var results = await Task.WhenAll(attempts);
+
+        Assert.Single(results, r => r.Outcome == "approved");
+        Assert.Single(results, r => r.Outcome == "conflict");
+
+        var winner = results.Single(r => r.Outcome == "approved").Response!;
+        Assert.Equal("Approved", winner.Status);
+        Assert.NotNull(winner.Grant);
+        Assert.NotNull(winner.DecisionId);
+
+        // Exactly one grant decision for this debit - not two - and the request's own DecisionId points
+        // at it, not silently overwritten by a second, competing completion.
+        await using var verifyCtx = fixture.CreateContext();
+        var decisions = await verifyCtx.AuthorizationDecisions
+            .Where(d => d.RequestedBy == customerA && d.DebitAccountId == "ACC-RACE")
+            .ToListAsync();
+        Assert.Single(decisions);
+        Assert.True(decisions[0].Approved);
+
+        var storedRequest = await verifyCtx.PendingApprovalRequests.AsNoTracking().SingleAsync(r => r.RequestId == requestId);
+        Assert.Equal(PendingApprovalRequestStatus.Approved, storedRequest.Status);
+        Assert.Equal(decisions[0].DecisionId, storedRequest.DecisionId);
+
+        // Exactly 2 valid approvals recorded (A's own + the winner's) - the loser's own approve call
+        // never reached the point of inserting a row, since it was rejected before that (NotPending).
+        var approvalCount = await verifyCtx.ApprovalRecords
+            .Include(a => a.PendingApprovalRequest)
+            .CountAsync(a => a.PendingApprovalRequest.RequestId == requestId && a.VoidedAt == null);
+        Assert.Equal(2, approvalCount);
+    }
+
+    // --- QA follow-up (Should fix): a real end-to-end cascade test, not just a simulated bypass -------
+    //
+    // LiveRecheckAtThresholdCompletion_CatchesAHolderRevokedWithoutGoingThroughTheEagerVoidPath (above)
+    // simulates the Closed/Deceased cascade's bypass of MandateService's own eager void by directly
+    // mutating the Mandates row the same way CustomerService.CascadeMandateRevocationAndFreezeAsync does.
+    // This test calls that real cascade method instead, removing the "probably behaves the same way"
+    // inference.
+    [Fact]
+    public async Task LiveRecheckAtThresholdCompletion_CatchesAHolderClosedViaTheRealCustomerClosedCascade()
+    {
+        var customerA = await CreateCustomerAsync("Holder A");
+        var customerB = await CreateCustomerAsync("Holder B");
+        await AttachMandateAsync(customerA, "ACC-REALCASCADE", "Debit");
+        await AttachMandateAsync(customerB, "ACC-REALCASCADE", "Debit");
+        await SetRequiredApprovalsAsync("ACC-REALCASCADE", 2, customerA, customerB);
+
+        string requestId;
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, "ACC-REALCASCADE"));
+            requestId = Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId;
+        }
+
+        // The real cascade (DESIGN.md Section 2.1, decision #14): Closed/Deceased automatically revokes
+        // every mandate the customer holds. This does NOT go through MandateService.RevokeMandateAsync,
+        // so the eager-void mechanism (decision #24's other half, scoped to that method only - #TBD-23)
+        // never runs here either - exactly the real-world path the simulated bypass test stands in for.
+        await using (var ctx = fixture.CreateContext())
+        {
+            await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+                .CloseCustomerAsync(customerA, new CustomerStatusChangeRequest("real cascade test"));
+        }
+
+        // Sanity check: A's own ApprovalRecord on this request is still NOT voided - the cascade's own
+        // code path does not touch PendingApprovalRequests/ApprovalRecords at all (#TBD-23).
+        await using (var verifyCtx = fixture.CreateContext())
+        {
+            var aApproval = await verifyCtx.ApprovalRecords
+                .Include(a => a.PendingApprovalRequest)
+                .SingleAsync(a => a.CustomerId == customerA && a.PendingApprovalRequest.RequestId == requestId);
+            Assert.Null(aApproval.VoidedAt);
+        }
+
+        // B submits the last (2nd of 2) approval - the live re-check must independently discover A's
+        // mandate is no longer Active (revoked by the real Close cascade) and refuse to complete.
+        await using var approveCtx = fixture.CreateContext();
+        var response = await CreateJointApprovalService(approveCtx).ApproveAsync(requestId, new ApproveRequest(customerB));
+
+        Assert.Equal("Pending", response.Status);
+        Assert.Null(response.Grant);
+        Assert.Null(response.DecisionId);
+
+        await using var finalCtx = fixture.CreateContext();
+        var aApprovalAfter = await finalCtx.ApprovalRecords
+            .Include(a => a.PendingApprovalRequest)
+            .SingleAsync(a => a.CustomerId == customerA && a.PendingApprovalRequest.RequestId == requestId);
+        Assert.NotNull(aApprovalAfter.VoidedAt);
     }
 }

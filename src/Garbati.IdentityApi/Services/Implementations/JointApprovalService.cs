@@ -119,15 +119,51 @@ public class JointApprovalService(
         string requestId, ApproveRequest request, CancellationToken cancellationToken = default)
     {
         var now = DateTimeOffset.UtcNow;
+
+        // QA-flagged concurrency fix: without a row lock, two different holders racing the final
+        // approval of the same request can each independently load the pre-existing approval count,
+        // each add their own, each conclude the threshold is met, and each run the completion logic -
+        // two signed grants for a request that must resolve exactly once. SELECT ... FOR UPDATE locks
+        // THIS request's row for the rest of this method, so a concurrent ApproveAsync call on the same
+        // requestId blocks until this one commits (or rolls back) - the same "decide and act atomically
+        // under concurrency" category of problem LedgerApi solves by locking accounts before posting
+        // (ARCHITECTURE.md Section 12.5), applied here to one row instead of a set of ledger accounts.
+        // A real database-enforced guard, not an application-level check: Postgres itself blocks the
+        // second transaction, it is not this code "being careful."
+        //
+        // The FOR UPDATE row lock also blocks a concurrent INSERT of a new ApprovalRecord against this
+        // same PendingApprovalRequestId before it can even start, not only the final status update:
+        // inserting a child row with a foreign key to a locked parent row requires Postgres to take a
+        // FOR KEY SHARE lock on that parent, which conflicts with (and so waits behind) the FOR UPDATE
+        // lock already held here. So the whole "load approvals, add one, maybe complete" sequence below
+        // is serialized per request, not just the completion step.
+        //
+        // Approvals are loaded as a second, separate statement (Collection(...).LoadAsync, not
+        // Include() composed onto the locking query) because Postgres refuses FOR UPDATE on the
+        // outer-joined side of the LEFT JOIN an Include() on a collection navigation would add
+        // ("FOR UPDATE cannot be applied to the nullable side of an outer join") - no such join is
+        // needed for that second statement to see every approval already committed against this row,
+        // since nothing else can have inserted one without first winning the very lock held below.
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+
         var pending = await dbContext.PendingApprovalRequests
-            .Include(r => r.Approvals)
-            .FirstOrDefaultAsync(r => r.RequestId == requestId, cancellationToken)
+            .FromSqlInterpolated($"SELECT * FROM pending_approval_requests WHERE request_id = {requestId} FOR UPDATE")
+            .FirstOrDefaultAsync(cancellationToken)
             ?? throw new PendingApprovalRequestNotFoundException($"Pending approval request '{requestId}' was not found.");
+
+        await dbContext.Entry(pending).Collection(r => r.Approvals).LoadAsync(cancellationToken);
 
         await ExpireIfPastDueAsync(pending, now, cancellationToken);
 
         if (pending.Status != PendingApprovalRequestStatus.Pending)
         {
+            // Committed before throwing (not left to the transaction's automatic rollback-on-dispose):
+            // if ExpireIfPastDueAsync just wrote the Expired transition, that fact is real and must
+            // persist regardless of why this particular approve call is then rejected. This is also
+            // exactly the "clean conflict response" a holder who loses the race above receives: having
+            // been unblocked by the winner's commit, they load a request that is now Approved, not
+            // Pending, and this check reports that - no second grant, no silent overwrite.
+            await transaction.CommitAsync(cancellationToken);
             throw new PendingApprovalRequestNotPendingException(
                 $"Pending approval request '{requestId}' is {pending.Status}, not Pending.");
         }
@@ -201,6 +237,7 @@ public class JointApprovalService(
         var validApprovals = pending.Approvals.Where(a => a.VoidedAt is null).ToList();
         if (validApprovals.Count < pending.RequiredApprovals)
         {
+            await transaction.CommitAsync(cancellationToken);
             return ToResponse(pending);
         }
 
@@ -241,12 +278,16 @@ public class JointApprovalService(
             // Pending, waiting for a replacement approval from a currently-active holder (or expiry) - the
             // grant/policy change is NOT issued on this call.
             await dbContext.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
             return ToResponse(pending);
         }
 
-        return pending.Kind == PendingApprovalRequestKind.Debit
+        var result = pending.Kind == PendingApprovalRequestKind.Debit
             ? await CompleteDebitRequestAsync(pending, now, cancellationToken)
             : await CompleteThresholdChangeRequestAsync(pending, now, cancellationToken);
+
+        await transaction.CommitAsync(cancellationToken);
+        return result;
     }
 
     // DESIGN.md Section 3.8.1 phase 2: "IdentityApi performs the ordinary single-holder authorization
