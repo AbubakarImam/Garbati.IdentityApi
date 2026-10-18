@@ -16,6 +16,12 @@ public static class IdentityScopes
     public const string AuthorizationCheck = "identity.authorization.check";
     public const string OpsFreeze = "identity.ops.freeze";
 
+    // DESIGN.md Section 5.2/8.1, decision #30 (T-020): gates reversal authorization requests and the
+    // reversal-outcome endpoint. Never granted to a customer-facing channel's service identity - only to
+    // a dedicated ops client (see appsettings.Development.json's "dev-ops"), matching identity.ops.freeze's
+    // existing "restricted internal scope" precedent.
+    public const string OpsReversal = "identity.ops.reversal";
+
     public static readonly IReadOnlyList<string> All =
-        [CustomerRead, CustomerWrite, KycManage, MandateRead, MandateWrite, AuthorizationCheck, OpsFreeze];
+        [CustomerRead, CustomerWrite, KycManage, MandateRead, MandateWrite, AuthorizationCheck, OpsFreeze, OpsReversal];
 }

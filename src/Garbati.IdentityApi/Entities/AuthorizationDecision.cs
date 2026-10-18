@@ -20,6 +20,12 @@ public class AuthorizationDecision
     public string Currency { get; set; } = null!;
     public string IdempotencyKey { get; set; } = null!;
     public string? MandateId { get; set; }
+
+    // T-020 addition (DESIGN.md Section 8.4/8.5): the reversal reason code (DUPL/TECH/FRAD/CUST/UNAUTH),
+    // null for every other operation. Persisted here (not just in the signed grant claim) because the
+    // grant itself is never logged or stored (decision #13) - without this column, the reason code would
+    // be unrecoverable the moment the 30-second grant expires.
+    public string? ReasonCode { get; set; }
     public bool Approved { get; set; }
     public string? DenialReason { get; set; }
     public DateTimeOffset CreatedAt { get; set; }

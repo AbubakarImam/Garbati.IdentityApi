@@ -41,7 +41,7 @@ public class PostgresFixture : IAsyncLifetime
         await context.Database.ExecuteSqlRawAsync(
             "TRUNCATE TABLE customers, customer_identity_data, kyc_verifications, audit_events, outbox_messages, " +
             "mandates, mandate_permissions, mandate_approval_policies, authorization_decisions, " +
-            "pending_approval_requests, approval_records RESTART IDENTITY CASCADE");
+            "pending_approval_requests, approval_records, reversal_outcomes RESTART IDENTITY CASCADE");
     }
 }
 

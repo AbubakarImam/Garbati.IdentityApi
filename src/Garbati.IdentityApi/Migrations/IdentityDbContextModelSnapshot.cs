@@ -193,6 +193,10 @@ namespace Garbati.IdentityApi.Migrations
                         .HasColumnType("text")
                         .HasColumnName("operation");
 
+                    b.Property<string>("ReasonCode")
+                        .HasColumnType("text")
+                        .HasColumnName("reason_code");
+
                     b.Property<string>("RequestedBy")
                         .IsRequired()
                         .HasColumnType("text")
@@ -200,6 +204,9 @@ namespace Garbati.IdentityApi.Migrations
 
                     b.HasKey("Id")
                         .HasName("pk_authorization_decisions");
+
+                    b.HasAlternateKey("DecisionId")
+                        .HasName("ak_authorization_decisions_decision_id");
 
                     b.HasIndex("DecisionId")
                         .IsUnique()
@@ -727,6 +734,51 @@ namespace Garbati.IdentityApi.Migrations
                         });
                 });
 
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.ReversalOutcome", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("AuthorizationDecisionId")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("authorization_decision_id");
+
+                    b.Property<string>("Notes")
+                        .HasColumnType("text")
+                        .HasColumnName("notes");
+
+                    b.Property<string>("Outcome")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("outcome");
+
+                    b.Property<DateTimeOffset>("RecordedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("recorded_at");
+
+                    b.Property<string>("RecordedBy")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("recorded_by");
+
+                    b.HasKey("Id")
+                        .HasName("pk_reversal_outcomes");
+
+                    b.HasIndex("AuthorizationDecisionId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_reversal_outcomes_authorization_decision_id");
+
+                    b.ToTable("reversal_outcomes", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_reversal_outcomes_outcome", "\"outcome\" IN ('Completed', 'WriteOff')");
+                        });
+                });
+
             modelBuilder.Entity("Garbati.IdentityApi.Entities.ApprovalRecord", b =>
                 {
                     b.HasOne("Garbati.IdentityApi.Entities.PendingApprovalRequest", "PendingApprovalRequest")
@@ -785,6 +837,17 @@ namespace Garbati.IdentityApi.Migrations
                         .HasConstraintName("fk_mandate_permissions_mandates_mandate_id");
 
                     b.Navigation("Mandate");
+                });
+
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.ReversalOutcome", b =>
+                {
+                    b.HasOne("Garbati.IdentityApi.Entities.AuthorizationDecision", null)
+                        .WithMany()
+                        .HasForeignKey("AuthorizationDecisionId")
+                        .HasPrincipalKey("DecisionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired()
+                        .HasConstraintName("fk_reversal_outcomes_authorization_decisions_authorization_dec");
                 });
 
             modelBuilder.Entity("Garbati.IdentityApi.Entities.Customer", b =>

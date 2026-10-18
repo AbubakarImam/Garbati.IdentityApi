@@ -20,6 +20,7 @@ public class IdentityDbContext(DbContextOptions<IdentityDbContext> options) : Db
     public DbSet<AuthorizationDecision> AuthorizationDecisions => Set<AuthorizationDecision>();
     public DbSet<PendingApprovalRequest> PendingApprovalRequests => Set<PendingApprovalRequest>();
     public DbSet<ApprovalRecord> ApprovalRecords => Set<ApprovalRecord>();
+    public DbSet<ReversalOutcome> ReversalOutcomes => Set<ReversalOutcome>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -185,6 +186,27 @@ public class IdentityDbContext(DbContextOptions<IdentityDbContext> options) : Db
                 .WithMany(r => r.Approvals)
                 .HasForeignKey(a => a.PendingApprovalRequestId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // DESIGN.md Section 8.6/7.1, decision #34, T-020. AuthorizationDecisionId references
+        // AuthorizationDecision's own DecisionId (a string, not its internal numeric Id) - both tables
+        // live in the same database, so this is a real, enforced foreign key (Section 7.4), not just an
+        // opaque cross-service string the way LedgerAccountId is. The unique index is the actual "at most
+        // one outcome per decision" guard (decision #34: "a real DB constraint, not just app code"),
+        // mirroring decision #19/#25's established precedent elsewhere in this schema.
+        modelBuilder.Entity<ReversalOutcome>(entity =>
+        {
+            entity.HasKey(o => o.Id);
+            entity.HasIndex(o => o.AuthorizationDecisionId).IsUnique();
+            entity.Property(o => o.Outcome).HasConversion<string>();
+            entity.ToTable(t => t.HasCheckConstraint(
+                "ck_reversal_outcomes_outcome", "\"outcome\" IN ('Completed', 'WriteOff')"));
+
+            entity.HasOne<AuthorizationDecision>()
+                .WithMany()
+                .HasForeignKey(o => o.AuthorizationDecisionId)
+                .HasPrincipalKey(d => d.DecisionId)
+                .OnDelete(DeleteBehavior.Restrict);
         });
     }
 }
