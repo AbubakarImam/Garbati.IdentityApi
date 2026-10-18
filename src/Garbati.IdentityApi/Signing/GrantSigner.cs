@@ -80,6 +80,33 @@ public sealed class GrantSigner : IGrantSigner
         // (SigningCredentials.Key.KeyId above) - RFC 8725 Section 3.1 pins algorithm/kid on the
         // verifier's side, never trusting the token to say what to use; that verifier does not exist yet
         // (LedgerApi decision #47 is deferred - DESIGN.md decision #27/D-6).
+        var tokenClaims = new Dictionary<string, object>
+        {
+            ["typ"] = GrantType,
+            ["jti"] = claims.Jti,
+            ["sub"] = claims.Sub,
+            ["kid"] = _kid,
+            ["operation"] = claims.Operation,
+            ["debitAccountId"] = claims.DebitAccountId,
+            ["creditAccountId"] = claims.CreditAccountId,
+            ["amount"] = claims.Amount,
+            ["currency"] = claims.Currency,
+            ["idempotencyKey"] = claims.IdempotencyKey,
+        };
+
+        // T-020 (DESIGN.md Section 8.5, decision #33): "reuses the existing signed-grant machinery
+        // exactly ... with operation: 'Reversal' and the reason code as an added claim." Both claims are
+        // added only when present, so a pre-T-020 grant (every non-Reversal operation always has a
+        // mandateId, never a reasonCode) is byte-for-byte unchanged.
+        if (claims.MandateId is not null)
+        {
+            tokenClaims["mandateId"] = claims.MandateId;
+        }
+        if (claims.ReasonCode is not null)
+        {
+            tokenClaims["reasonCode"] = claims.ReasonCode;
+        }
+
         var descriptor = new SecurityTokenDescriptor
         {
             Issuer = Issuer,
@@ -88,20 +115,7 @@ public sealed class GrantSigner : IGrantSigner
             NotBefore = claims.IssuedAt.UtcDateTime,
             Expires = claims.ExpiresAt.UtcDateTime,
             SigningCredentials = credentials,
-            Claims = new Dictionary<string, object>
-            {
-                ["typ"] = GrantType,
-                ["jti"] = claims.Jti,
-                ["sub"] = claims.Sub,
-                ["kid"] = _kid,
-                ["operation"] = claims.Operation,
-                ["debitAccountId"] = claims.DebitAccountId,
-                ["creditAccountId"] = claims.CreditAccountId,
-                ["amount"] = claims.Amount,
-                ["currency"] = claims.Currency,
-                ["idempotencyKey"] = claims.IdempotencyKey,
-                ["mandateId"] = claims.MandateId,
-            },
+            Claims = tokenClaims,
         };
 
         var token = _handler.CreateToken(descriptor);
