@@ -21,6 +21,7 @@ public class MigrationTests(PostgresFixture fixture)
         Assert.Contains(applied, m => m.EndsWith("AddIdempotencyToCustomers"));
         Assert.Contains(applied, m => m.EndsWith("AddMandatesAndAuthorization"));
         Assert.Contains(applied, m => m.EndsWith("AddJointApprovalWorkflow"));
+        Assert.Contains(applied, m => m.EndsWith("AddReversalAuthorization"));
     }
 
     [Fact]
@@ -62,7 +63,7 @@ public class MigrationTests(PostgresFixture fixture)
 
         await AssertColumnsAsync(ctx, "authorization_decisions",
             "id", "decision_id", "requested_by", "operation", "debit_account_id", "credit_account_id",
-            "amount", "currency", "idempotency_key", "mandate_id", "approved", "denial_reason",
+            "amount", "currency", "idempotency_key", "mandate_id", "reason_code", "approved", "denial_reason",
             "created_at", "grant_expires_at");
 
         await AssertColumnsAsync(ctx, "pending_approval_requests",
@@ -73,6 +74,9 @@ public class MigrationTests(PostgresFixture fixture)
 
         await AssertColumnsAsync(ctx, "approval_records",
             "id", "pending_approval_request_id", "customer_id", "approved_at", "voided_at", "voided_reason");
+
+        await AssertColumnsAsync(ctx, "reversal_outcomes",
+            "id", "authorization_decision_id", "outcome", "recorded_at", "recorded_by", "notes");
     }
 
     [Fact]

@@ -94,6 +94,7 @@ try
     builder.Services.AddScoped<IMandateService, MandateService>();
     builder.Services.AddScoped<ITransactionAuthorizationService, AuthorizationService>();
     builder.Services.AddScoped<IJointApprovalService, JointApprovalService>();
+    builder.Services.AddScoped<IReversalAuthorizationService, ReversalAuthorizationService>();
     builder.Services.AddScoped<IAuditLogger, AuditLogger>();
 
     builder.Services.AddScoped<CreateCustomerRequestValidator>();
@@ -104,6 +105,7 @@ try
     builder.Services.AddScoped<AuthorizationRequestValidator>();
     builder.Services.AddScoped<ApproveRequestValidator>();
     builder.Services.AddScoped<ChangeApprovalPolicyRequestValidator>();
+    builder.Services.AddScoped<RecordReversalOutcomeRequestValidator>();
 
     var app = builder.Build();
 

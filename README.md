@@ -71,8 +71,9 @@ Service tests run against a real PostgreSQL container started by [Testcontainers
 | `GET` | `/v1/accounts/{ledgerAccountId}/mandates` | List every active holder of an account |
 | `GET` | `/v1/mandates/{mandateId}` | One mandate's status and permissions |
 | `POST` | `/v1/mandates/{mandateId}/revoke` | Revoke a mandate (idempotent if already revoked) - requires a `reason` |
-| `POST` | `/v1/authorization/requests` | Request a signed, transaction-bound authorization grant. Resolves synchronously - approved (200, with the grant) or denied (422, with a reason code) |
+| `POST` | `/v1/authorization/requests` | Request a signed, transaction-bound authorization grant. Resolves synchronously - approved (200, with the grant) or denied (422, with a reason code). Also accepts `operation: "Reversal"` (see [Reversal authorization](#reversal-authorization)) |
 | `GET` | `/v1/authorization/requests/{id}` | Look up a past decision by id - never re-serves the grant itself |
+| `POST` | `/v1/authorization/requests/{id}/reversal-outcome` | Record a reversal's ultimate recovery outcome (`Completed`/`WriteOff`) - see [Reversal authorization](#reversal-authorization) |
 
 `close` and `mark-deceased` are T-016's own addition - `docs/DESIGN.md` Section 5.1 lists only `suspend`/`reactivate`; see Appendix B for why.
 
@@ -84,8 +85,8 @@ Service tests run against a real PostgreSQL container started by [Testcontainers
 | `400` | Request failed validation |
 | `401` | Missing or unknown API key |
 | `403` | The API key lacks the endpoint's scope |
-| `404` | Customer or mandate not found |
-| `409` | Customer status transition not allowed (e.g. closing an already-Closed customer), a customer already has an active mandate on the account, or an idempotency key reused with a different request |
+| `404` | Customer, mandate, or authorization decision not found |
+| `409` | Customer status transition not allowed (e.g. closing an already-Closed customer), a customer already has an active mandate on the account, an idempotency key reused with a different request, or a reversal outcome request against a decision that isn't an approved Reversal (or already has an outcome) |
 | `422` | Authorization request denied - see [Authorization grants](#authorization-grants) |
 | `500` | Unexpected error |
 
@@ -113,6 +114,14 @@ The grant itself is never logged or persisted anywhere - only its `jti` (the dec
 
 No LedgerApi exists yet to actually verify a grant (decision #47 is deferred, per decision #27/D-6) - nothing here assumes it does.
 
+### Reversal authorization
+
+`docs/DESIGN.md` Section 8 (decisions #30-#35): a reversal request comes only from a trusted internal ops caller (never a customer-facing channel), and deliberately bypasses the account's own mandate/`MandateApprovalPolicy` entirely - the ops channel's own maker-checker process (which does not exist yet) is the real gate, not a second approval-collection system inside IdentityApi.
+
+`POST /v1/authorization/requests` accepts `operation: "Reversal"` with a required `reasonCode` (`DUPL`/`TECH`/`FRAD`/`CUST`/`UNAUTH` - `DISPUTE` is deliberately not supported yet). It is gated by `identity.ops.reversal`, not `identity.authorization.check` - the only endpoint in this service where the same route needs two different, mutually exclusive scopes depending on the request body. On success it returns the same signed grant shape as any other operation, with `operation: "Reversal"` and the reason code as an added claim, and no `mandateId` claim at all (there is no mandate behind a reversal).
+
+`POST /v1/authorization/requests/{id}/reversal-outcome` (scope: `identity.ops.reversal`) records the reversal's ultimate recovery outcome once it's known - `Completed` or `WriteOff`, nothing else. It is a thin audit record, not a collections/lien workflow: `404` if the decision doesn't exist, `409` if it exists but wasn't an approved Reversal decision, `409` again on a second attempt to record an outcome for the same decision.
+
 ## Authentication
 
 Same pattern as LedgerApi (`ARCHITECTURE.md` Section 5): every request needs an `X-Api-Key` header, and each key is granted **scopes**:
@@ -124,9 +133,12 @@ Same pattern as LedgerApi (`ARCHITECTURE.md` Section 5): every request needs an 
 | `identity.kyc.manage` | `PATCH /v1/customers/{customerId}/kyc` |
 | `identity.mandate.read` | `GET /v1/customers/{customerId}/mandates`, `GET /v1/accounts/{ledgerAccountId}/mandates`, `GET /v1/mandates/{mandateId}` |
 | `identity.mandate.write` | `POST /v1/customers/{customerId}/mandates`, `POST /v1/mandates/{mandateId}/revoke` |
-| `identity.authorization.check` | `POST /v1/authorization/requests`, `GET /v1/authorization/requests/{id}` |
+| `identity.authorization.check` | `POST /v1/authorization/requests`, `GET /v1/authorization/requests/{id}` (for `operation` values other than `"Reversal"`) |
+| `identity.ops.reversal` | `POST /v1/authorization/requests` (only for `operation: "Reversal"`), `POST /v1/authorization/requests/{id}/reversal-outcome` |
 
 `identity.ops.freeze` is defined (`docs/DESIGN.md` Section 5.2) but not wired to any endpoint yet - it is reserved for the Orchestrator's own outbox-consumption path (Section 2.5), which doesn't exist until the Orchestrator does.
+
+`POST /v1/authorization/requests` is the one endpoint in this service gated by two different, mutually exclusive scopes depending on the request body's `operation` value, not by a single static policy - see [Reversal authorization](#reversal-authorization).
 
 A missing or unknown key gets **401**; a valid key without the endpoint's scope gets **403**.
 
@@ -137,7 +149,7 @@ A missing or unknown key gets **401**; a valid key without the endpoint's scope 
 | Client | Scopes |
 |---|---|
 | `dev-orchestrator` | customer.read, customer.write, kyc.manage, mandate.read, mandate.write, authorization.check |
-| `dev-ops` | customer.read, customer.write, kyc.manage, mandate.read, mandate.write, ops.freeze |
+| `dev-ops` | customer.read, customer.write, kyc.manage, mandate.read, mandate.write, ops.freeze, ops.reversal |
 
 ### Issuing a key
 
@@ -202,6 +214,6 @@ tests/Garbati.IdentityApi.Tests/
 docs/DESIGN.md      Design document and decisions log
 ```
 
-## Out of scope (T-018)
+## Out of scope
 
-Section 3.8's joint-account, multi-holder approval workflow: `PendingApprovalRequests`, `ApprovalRecords`, `.../requests/{id}/approve`, `/v1/accounts/{id}/approval-policy` and its change-request endpoint, any `RequiredApprovals > 1` logic, planned key rotation (4.3.1) and the emergency key-compromise procedure (4.3.2) themselves (only a config shape that doesn't block adding them). Reversal authority (T-015, still undesigned). Real LedgerApi account-existence calls (LedgerApi has no code to call yet). See `docs/DESIGN.md` Appendix C for why.
+Planned key rotation (4.3.1) and the emergency key-compromise procedure (4.3.2) themselves (only a config shape that doesn't block adding them later). Real LedgerApi account-existence/transaction-reference calls (LedgerApi has no code to call yet). Any `PendingApprovalRequest`-style approval-collection workflow for reversals, any lien/auto-sweep mechanism, and the `DISPUTE` reversal reason code - all three deliberately out of scope per `docs/DESIGN.md` Section 8 (decisions #30/#32/#34). The ops channel itself (its maker-checker UI/process) - it doesn't exist and isn't designed here. See `docs/DESIGN.md` Appendices B-E for the full history of what each build task added.

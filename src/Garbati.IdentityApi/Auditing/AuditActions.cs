@@ -25,4 +25,12 @@ public static class AuditActions
     public const string ApprovalVoided = "ApprovalVoided";
     public const string PendingApprovalRequestExpired = "PendingApprovalRequestExpired";
     public const string PendingApprovalRequestResolved = "PendingApprovalRequestResolved";
+
+    // T-020 additions (DESIGN.md Section 6.3/8, garbati-platform T-020): a reversal authorization decision
+    // uses the same AuthorizationApproved action above when granted (ReversalAuthorizationService reuses
+    // AuthorizationDecision exactly like every other operation) - there is no separate "requested" event
+    // because, per decision #30/#31, there is no separate request/decide phase to split apart (unlike the
+    // T-018 PendingApprovalRequest lifecycle, this is a single synchronous call, same as a single-holder
+    // Debit before T-018 existed). ReversalOutcomeRecorded is the one genuinely new lifecycle event.
+    public const string ReversalOutcomeRecorded = "ReversalOutcomeRecorded";
 }

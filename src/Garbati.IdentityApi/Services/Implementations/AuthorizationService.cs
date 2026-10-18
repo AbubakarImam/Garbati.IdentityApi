@@ -93,7 +93,11 @@ public class AuthorizationService(IdentityDbContext dbContext, IAuditLogger audi
             Sub: request.RequestedBy,
             Operation: operation.ToString(),
             DebitAccountId: request.DebitAccountId,
-            CreditAccountId: request.CreditAccountId,
+            // T-020 made AuthorizationRequest.CreditAccountId nullable (it has no meaning for a Reversal
+            // request) - but this method is only ever reached for a non-Reversal MandateOperation (the
+            // Enum.Parse above would throw for "Reversal"), and AuthorizationRequestValidator already
+            // requires CreditAccountId for every one of those, so it is never actually null here.
+            CreditAccountId: request.CreditAccountId!,
             Amount: amount,
             Currency: request.Currency,
             IdempotencyKey: request.IdempotencyKey,
@@ -170,5 +174,6 @@ public class AuthorizationService(IdentityDbContext dbContext, IAuditLogger audi
         decision.Amount,
         decision.Currency,
         decision.MandateId,
-        decision.CreatedAt);
+        decision.CreatedAt,
+        decision.ReasonCode);
 }
