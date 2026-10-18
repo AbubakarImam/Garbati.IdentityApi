@@ -76,6 +76,11 @@ public class ExceptionHandlingMiddleware(RequestDelegate next, ILogger<Exception
         DuplicateApprovalException => (StatusCodes.Status409Conflict, "This holder has already approved this request."),
         InvalidApprovalThresholdException => (StatusCodes.Status400BadRequest, "Invalid RequiredApprovals value."),
         JointApprovalDeniedException => (StatusCodes.Status422UnprocessableEntity, "Joint approval denied."),
+
+        // T-020 additions (DESIGN.md Section 8.6).
+        AuthorizationDecisionNotFoundException => (StatusCodes.Status404NotFound, "Authorization decision not found."),
+        ReversalOutcomeNotEligibleException => (StatusCodes.Status409Conflict, "This decision cannot accept a reversal outcome."),
+        DuplicateReversalOutcomeException => (StatusCodes.Status409Conflict, "A reversal outcome has already been recorded for this decision."),
         _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred.")
     };
 }
