@@ -60,14 +60,13 @@ jobs:
           push: false
           cache-from: type=gha
 
-  # Mirrors LedgerApi's deploy job shape (its own ci.yml) for a future Azure App Service deployment.
-  # Only runs on a push to main, never on a pull request, so it cannot block or fail this PR's checks.
+  # Mirrors LedgerApi's deploy job shape. Only runs on a push to main, never on a pull request.
   #
-  # NOT WIRED UP YET: RESOURCE_GROUP/APP_NAME/DB_SERVER/APP_URL below are placeholders, and the
-  # azure/login secrets (AZUREAPPSERVICE_CLIENTID_*, _TENANTID_*, _SUBSCRIPTIONID_*) do not exist for
-  # this repo yet. Per the task file: getting test/docker green is what matters for this task; this job
-  # needs the owner's actual Azure resource names and a configured federated credential before it can
-  # run for real. Flagged in the PR description.
+  # Wired up 18 Oct 2026: shares LedgerApi's App Service Plan (ASP-ledgerrg-8f31) and Postgres Flexible
+  # Server (ledgerapi-db-san) to avoid a second Plan's/server's cost - IdentityApi still gets its own
+  # App Service and its own database, just not its own dedicated infrastructure. The managed identity
+  # (ledgerapi-id-b111) is the same one LedgerApi uses, with an additional federated credential scoped to
+  # this repo's main branch and a Website Contributor role assignment scoped to garbati-identityapi only.
   deploy:
     needs: [test, docker]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -79,10 +78,10 @@ jobs:
       group: deploy-production
       cancel-in-progress: false # never stop a deploy halfway
     env:
-      RESOURCE_GROUP: identity-rg # TODO (owner): real resource group name
-      APP_NAME: identityapi # TODO (owner): real App Service name
-      DB_SERVER: identityapi-db-san # TODO (owner): real Postgres Flexible Server name
-      APP_URL: https://CHANGE-ME.azurewebsites.net # TODO (owner): real App Service URL
+      RESOURCE_GROUP: ledger-rg # shared with LedgerApi's App Service Plan and Postgres server
+      APP_NAME: garbati-identityapi
+      DB_SERVER: ledgerapi-db-san # shared server; IdentityApi has its own database on it, not its own server
+      APP_URL: https://garbati-identityapi.azurewebsites.net
       FIREWALL_RULE: github-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
@@ -103,8 +102,6 @@ jobs:
           dotnet tool restore
           dotnet ef migrations bundle --project src/Garbati.IdentityApi --configuration Release --output efbundle
 
-      # TODO (owner): set up a managed identity trusted for this repo's main branch (Deployment Center),
-      # the same way LedgerApi's ledgerapi-id-b111 is, then fill in the secret names below.
       - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_IDENTITYAPI }}
