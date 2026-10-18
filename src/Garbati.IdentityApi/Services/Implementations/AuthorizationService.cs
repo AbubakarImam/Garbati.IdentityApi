@@ -10,11 +10,16 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Garbati.IdentityApi.Services;
 
-// DESIGN.md Section 3 (3.1-3.7 only - Section 3.8's joint-account collect-approvals workflow is T-018).
-// This task's authorization endpoint only ever has to satisfy M = 1: the requester's own mandate is
-// always enough, because nothing yet lets an account have RequiredApprovals > 1 (see
-// AuthorizationDenialReasons.ApprovalPolicyNotSingleHolder - that check exists so the one assumption the
-// rest of this method depends on is verified, not assumed).
+// DESIGN.md Section 3 (3.1-3.7 - Section 3.8's joint-account collect-approvals workflow is
+// JointApprovalService, T-018). RequestAuthorizationAsync itself still only ever has to satisfy M = 1:
+// JointApprovalService checks the account's MandateApprovalPolicy BEFORE calling anything here, and only
+// ever reaches this method when RequiredApprovals <= 1 (see AuthorizationDenialReasons.
+// ApprovalPolicyNotSingleHolder below - that check exists so the one assumption the rest of this method
+// depends on is verified, not assumed, even though nothing should ever call it otherwise now).
+//
+// IssueApprovedGrantAsync and RecordDenialAsync (T-018) are the sign-and-persist / deny-and-persist
+// halves of this same logic, extracted so JointApprovalService can reuse them once a
+// PendingApprovalRequest's threshold is met (3.8.1 phase 2), instead of duplicating them.
 //
 // Fail-closed (decision #10) is structural here, not a special code path: every lookup that can throw
 // (a DB error, an unexpected exception) simply propagates to the caller as an unhandled exception -
@@ -32,53 +37,19 @@ public class AuthorizationService(IdentityDbContext dbContext, IAuditLogger audi
         var operation = Enum.Parse<MandateOperation>(request.Operation, ignoreCase: true);
         var amount = request.Amount.ToString("G29", CultureInfo.InvariantCulture);
 
-        var customer = await dbContext.Customers.AsNoTracking()
-            .FirstOrDefaultAsync(c => c.CustomerId == request.RequestedBy, cancellationToken);
-
-        string? reasonCode =
-            customer is null ? AuthorizationDenialReasons.CustomerNotFound
-            : customer.CustomerStatus != CustomerStatus.Active ? AuthorizationDenialReasons.CustomerNotActive
-            : customer.KycStatus != KycStatus.Verified || customer.KycTier is null ? AuthorizationDenialReasons.CustomerNotVerified
-            : null;
-
-        // KYC-tier eligibility: the placeholder tier-policy lookup T-016 built (KycTierPolicies -
-        // configurable policy data, decision #11), not a bespoke rules engine for this task.
-        if (reasonCode is null)
-        {
-            var tierPolicy = await dbContext.KycTierPolicies.AsNoTracking()
-                .Where(p => p.JurisdictionCode == customer!.JurisdictionCode && p.TierCode == customer.KycTier
-                         && p.EffectiveFrom <= now && (p.EffectiveTo == null || p.EffectiveTo > now))
-                .FirstOrDefaultAsync(cancellationToken);
-
-            if (tierPolicy is null || !tierPolicy.EligibleOperations.Contains(operation.ToString()))
-            {
-                reasonCode = AuthorizationDenialReasons.OperationNotEligibleForKycTier;
-            }
-        }
-
-        Mandate? mandate = null;
-        if (reasonCode is null)
-        {
-            mandate = await dbContext.Mandates.AsNoTracking()
-                .Include(m => m.Permissions)
-                .FirstOrDefaultAsync(
-                    m => m.CustomerId == customer!.Id && m.LedgerAccountId == request.DebitAccountId
-                         && m.Status == MandateStatus.Active,
-                    cancellationToken);
-
-            reasonCode = mandate switch
-            {
-                null => AuthorizationDenialReasons.NoActiveMandate,
-                _ when !mandate.Permissions.Any(p => p.Operation == operation) => AuthorizationDenialReasons.OperationNotPermittedByMandate,
-                _ => null,
-            };
-        }
+        // T-018: extracted to MandateEligibility.CheckAsync (the customer/KYC/mandate steps below are
+        // byte-for-byte what used to be inline here) so the joint-approval flow can reuse the exact same
+        // logic without duplicating it - identical reason codes, identical order, identical behavior.
+        var (reasonCode, mandate) = await MandateEligibility.CheckAsync(
+            dbContext, request.RequestedBy, request.DebitAccountId, operation, now, cancellationToken);
 
         if (reasonCode is null)
         {
-            // Defensive, not decorative (task file): this is the one assumption the entire single-holder
-            // flow depends on. No "if (requiredApprovals > 1)" branch exists anywhere - that belongs to
-            // T-018, which this task must not anticipate.
+            // Defensive, not decorative (T-017's task file): this is the one assumption this method's own
+            // single-holder flow depends on. T-018's JointApprovalService is the one place that branches
+            // on RequiredApprovals > 1 - it only ever calls THIS method once it has already confirmed
+            // RequiredApprovals <= 1 itself, so this check staying exactly as it was is defence in depth,
+            // not dead code.
             var policy = await dbContext.MandateApprovalPolicies.AsNoTracking()
                 .FirstOrDefaultAsync(p => p.LedgerAccountId == request.DebitAccountId, cancellationToken);
 
@@ -95,24 +66,12 @@ public class AuthorizationService(IdentityDbContext dbContext, IAuditLogger audi
                 decisionId, reasonCode, $"Authorization denied for decision '{decisionId}': {reasonCode}.");
         }
 
-        var expiresAt = now.AddSeconds(GrantLifetimeSeconds);
-        var grant = grantSigner.Sign(new GrantClaims(
-            Jti: decisionId,
-            Sub: customer!.CustomerId,
-            Operation: operation.ToString(),
-            DebitAccountId: request.DebitAccountId,
-            CreditAccountId: request.CreditAccountId,
-            Amount: amount,
-            Currency: request.Currency,
-            IdempotencyKey: request.IdempotencyKey,
-            MandateId: mandate!.MandateId,
-            IssuedAt: now,
-            ExpiresAt: expiresAt));
-
-        var decision = await PersistDecisionAsync(
-            decisionId, request, amount, now, approved: true, reasonCode: null, mandate.MandateId, cancellationToken, expiresAt);
-
-        return new AuthorizationResponse(ToDecisionResponse(decision), grant.Token, expiresAt);
+        // T-018: byte-for-byte what used to be inline here, moved into IssueApprovedGrantAsync so the
+        // joint-approval flow can call the exact same sign-and-persist logic once a PendingApprovalRequest
+        // reaches its threshold (3.8.1 phase 2), instead of duplicating it. `customer!.CustomerId` became
+        // `request.RequestedBy` - the two are guaranteed equal whenever reasonCode is null (MandateEligibility
+        // looked the customer up BY that exact CustomerId), so this is not a behavior change.
+        return await IssueApprovedGrantAsync(decisionId, request, mandate!.MandateId, now, cancellationToken);
     }
 
     public async Task<AuthorizationDecisionResponse?> GetDecisionAsync(string decisionId, CancellationToken cancellationToken = default)
@@ -120,6 +79,40 @@ public class AuthorizationService(IdentityDbContext dbContext, IAuditLogger audi
         var decision = await dbContext.AuthorizationDecisions.AsNoTracking()
             .FirstOrDefaultAsync(d => d.DecisionId == decisionId, cancellationToken);
         return decision is null ? null : ToDecisionResponse(decision);
+    }
+
+    public async Task<AuthorizationResponse> IssueApprovedGrantAsync(
+        string decisionId, AuthorizationRequest request, string mandateId, DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        var operation = Enum.Parse<MandateOperation>(request.Operation, ignoreCase: true);
+        var amount = request.Amount.ToString("G29", CultureInfo.InvariantCulture);
+        var expiresAt = now.AddSeconds(GrantLifetimeSeconds);
+        var grant = grantSigner.Sign(new GrantClaims(
+            Jti: decisionId,
+            Sub: request.RequestedBy,
+            Operation: operation.ToString(),
+            DebitAccountId: request.DebitAccountId,
+            CreditAccountId: request.CreditAccountId,
+            Amount: amount,
+            Currency: request.Currency,
+            IdempotencyKey: request.IdempotencyKey,
+            MandateId: mandateId,
+            IssuedAt: now,
+            ExpiresAt: expiresAt));
+
+        var decision = await PersistDecisionAsync(
+            decisionId, request, amount, now, approved: true, reasonCode: null, mandateId, cancellationToken, expiresAt);
+
+        return new AuthorizationResponse(ToDecisionResponse(decision), grant.Token, expiresAt);
+    }
+
+    public Task RecordDenialAsync(
+        string decisionId, AuthorizationRequest request, string reasonCode, DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        var amount = request.Amount.ToString("G29", CultureInfo.InvariantCulture);
+        return PersistDecisionAsync(decisionId, request, amount, now, approved: false, reasonCode, mandateId: null, cancellationToken);
     }
 
     private async Task<AuthorizationDecision> PersistDecisionAsync(
