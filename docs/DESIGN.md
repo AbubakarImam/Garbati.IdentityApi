@@ -396,6 +396,7 @@ A successful authorization response (once the threshold, however small, is met) 
 - `identity.mandate.write`
 - `identity.authorization.check` — covers both `POST /v1/authorization/requests` and `.../approve` (no separate scope needed; both are the same customer-facing authorization concern)
 - `identity.ops.freeze` — restricted internal scope for the operations/compliance actor and the Orchestrator's outbox-consumption path (2.5); never granted to a channel/payment service by default.
+- `identity.ops.reversal` — restricted internal scope for the ops channel's reversal-authorization calls (Section 8, decision #30); never granted to a customer-facing channel.
 
 LedgerApi continues to authenticate the Orchestrator as a service using its existing API-key-and-scope mechanism; the signed grant separately proves the integrity and origin of the customer authorization decision.
 
@@ -454,6 +455,7 @@ Audit events are append-only from ordinary application code, access-restricted a
 | `ApprovalRecords` | **(v2, new)** One row per holder's approval (or void) against a `PendingApprovalRequest`. |
 | `AuditEvents` | Durable history of important security and business actions. |
 | `OutboxMessages` | Durable work, such as account-freeze propagation to the Orchestrator, with retry and completion status. |
+| `ReversalOutcomes` | One row per reversal authorization decision once its ultimate outcome is known (`Completed`/`WriteOff`) — a thin audit record of the recovery decision's conclusion, not the recovery process itself (Section 8.6). |
 
 ### 7.2 Identity documents and sensitive data
 
@@ -473,9 +475,71 @@ IdentityApi and LedgerApi have separate databases; no database foreign key cross
 
 ---
 
-## 8. Reversal authority — explicitly NOT designed yet
+## 8. Reversal authority (decisions #30–#35)
 
-**Do not infer a design for this from the rest of the document.** Who may initiate a reversal, what reason codes or approvals are required, the expected operational response time, and how reconciliation handles an external effect a ledger reversal cannot itself undo (e.g. the recipient already withdrew the money elsewhere) are all **open**, tracked as `garbati-platform` **T-015**. The original v1 draft's Section 3.6/9 flagged this as unresolved; v2 has not resolved it either — it was deliberately deferred by the owner (16 Oct 2026) to its own dedicated design pass rather than a quick answer folded into this document. `research/identityapi-design-review.md` flags this as the one item most clearly tied to real financial-loss risk if left unresolved at build time — build T-015 before relying on reversal as a recovery path for anything beyond what LedgerApi's own existing chain-reversal mechanics (decision #45) already guarantee at the ledger level.
+**Status: designed, 18 Oct 2026** (`garbati-platform` T-015, informed by `research/reversal-authority-patterns.md`). This closes the gap v1 and v2 both left open. It deliberately does not touch the already-fixed **ledger mechanics** (`ARCHITECTURE.md` D-7, LedgerApi decision #45: all-or-nothing chain reversal, last leg first, no remediation path if a leg can't be undone) — it is entirely about the layer above that: who may ask IdentityApi to authorize a reversal, and what IdentityApi does with that request.
+
+### 8.1 Where this sits architecturally — the key simplification
+
+A reversal request reaches IdentityApi **only from a trusted ops channel** — never from a customer-facing channel, and never directly from a customer. This is the same "customers never call IdentityApi directly" principle that governs every other flow (Channel → Orchestrator → IdentityApi), narrowed further here: specifically the *ops* channel, authenticated as its own service identity, is the only permitted caller for a reversal authorization.
+
+Whatever maker-checker / dual-control discipline that ops channel enforces internally — who may request a reversal, who must approve it, what evidence they review — happens **before** it ever calls IdentityApi, inside tooling this document does not design and that does not exist yet. IdentityApi trusts that decision has already been made, exactly the way it already trusts the Orchestrator's own caller authentication for every other operation. This is a deliberate choice **not** to build a second approval-collection system alongside T-018's joint-account workflow — reversal authorization stays a simple, synchronous, single-call decision, like a single-holder (`M=1`) transfer request was before T-018 added the multi-holder case.
+
+**Decision #30.** Options considered: (a) build dual-control/maker-checker for reversals inside IdentityApi, mirroring T-018's `PendingApprovalRequest` workflow; (b) trust a single, restricted ops-channel caller and let that caller's own tooling handle approval. **Confirmed: (b).** A new scope, `identity.ops.reversal`, gates the endpoint; it is never granted to a customer-facing channel's service identity.
+
+### 8.2 Reversal bypasses the account's own mandate entirely
+
+A reversal authorization does **not** check the account's `MandateApprovalPolicy`, does not care whether the account is single-holder or joint, and does not require any mandate holder's approval — regardless of what the original transaction needed.
+
+**Decision #31.** Options considered: inherit the account's own `RequiredApprovals` threshold; require a lower bar (e.g. any one holder, since a reversal restores money rather than removing it); an ops override that bypasses the mandate model entirely. `research/reversal-authority-patterns.md` Q2 found no standard source answering this directly — a genuine gap, not a settled industry practice. **Confirmed: ops override.** The ops channel's own process (8.1) is the real gate; re-checking the customer's mandate would just duplicate a decision already made upstream, for a caller (ops) the mandate model was never designed to govern in the first place.
+
+### 8.3 What IdentityApi actually validates
+
+Given 8.1/8.2, there is no `PendingApprovalRequest`-equivalent for reversals. `POST /v1/authorization/requests` accepts a new `operation` value, `"Reversal"`, and the endpoint:
+
+- Confirms the caller holds `identity.ops.reversal` (checked the same way every other scope is, `AuthorizationController`/the existing policy infrastructure).
+- Requires a reference to the original transaction/chain (whatever identifier the Orchestrator and LedgerApi already use) — IdentityApi does not independently verify this reference exists at LedgerApi; it trusts the caller's assertion, the same pattern already used for `LedgerAccountId` at mandate attachment (2.4) and left as a `TODO` there for the same reason (LedgerApi has nothing to call yet).
+- Requires a reason code from the fixed list in 8.4.
+- Carries the same canonical fields every grant already binds (8.5): the original transaction reference in place of debit/credit accounts, amount/currency if meaningful for the reason code, idempotency key.
+
+### 8.4 Reason codes
+
+**Decision #32.** Reusing converged industry vocabulary (`research/reversal-authority-patterns.md` Q3 — ISO 20022 and the card networks already agree on the same handful of categories) instead of inventing GARBATI-specific names where a standard one exists:
+
+| Code | Meaning |
+|---|---|
+| `DUPL` | Duplicate posting |
+| `TECH` | Technical/processing error |
+| `FRAD` | Fraudulent origin |
+| `CUST` | Customer requested, no error claimed — the ops channel's own process is responsible for confirming the recipient's cooperation before calling this endpoint; IdentityApi does not enforce that |
+| `UNAUTH` | Customer disputes the transaction as never authorized by them (GARBATI-specific — no single ISO 20022 code maps to a consumer-facing claim; ISO 20022's codes are bank-to-bank message codes) |
+
+**`DISPUTE`** (a card-network-style "consumer dispute" category, for a future financing/merchant product) is explicitly **not** defined yet — the owner chose to add it only once that roadmap item actually exists, not speculatively now.
+
+### 8.5 Grant issuance
+
+**Decision #33.** A reversal authorization reuses the existing signed-grant machinery (3.3, `GrantSigner`) exactly — same claim shape, same 30-second expiry, same ES256 signing — with `operation: "Reversal"` and the reason code (8.4) as an additional claim. Options considered: a reversal-specific grant/token shape; reuse the existing grant shape with a new operation value. **Confirmed: reuse.** Nothing about `GrantSigner`, the key-management guard, or the claim-verification logic changes; only the set of valid `operation` values grows.
+
+### 8.6 Outcome recording, including write-off
+
+**Decision #34.** IdentityApi records every reversal authorization decision the same way it records any other (`AuthorizationDecision`) — and, in addition, tracks the reversal's **ultimate outcome** once it's known, including a distinct write-off event when the outcome is "could not be completed, money unrecoverable" (matching `research/reversal-authority-patterns.md` Q4's real-world distinction between a recoverable claim and a loss formally written off).
+
+Since IdentityApi never executes a reversal itself (the Orchestrator/LedgerApi do, per decision #17 — the Orchestrator is the single gate for every ledger-state-changing action), IdentityApi only *learns* the outcome once told — by a follow-up call from the ops channel (or the Orchestrator) reporting what LedgerApi's chain-reversal actually did.
+
+New entity, `ReversalOutcomes`: `AuthorizationDecisionId` (the original reversal grant's decision), `Outcome` (`Completed` / `WriteOff`), `RecordedAt`, `RecordedBy`, `Notes` (nullable). This is deliberately a **thin audit record**, not a collections/lien workflow — the actual recovery process (demand notices, watch-listing, escalation to law enforcement) stays entirely outside IdentityApi; `ReversalOutcomes` only records that a decision about recoverability was made and by whom, not how the recovery attempt itself was run.
+
+Options considered: no outcome tracking in IdentityApi at all (leave it fully to ops tooling, outside this service); track a distinct write-off event as above. **Confirmed: track it**, per the owner's explicit choice over the research's more conservative "fully out of scope" recommendation.
+
+### 8.7 Response time
+
+**Decision #35.** No code-enforced SLA anywhere in this flow. IdentityApi timestamps every reversal request, decision, and outcome exactly as it already timestamps every other authorization decision — that is the only "response time" artifact it produces. A real operational SLA (e.g. the ~2-business-day instant-EFT dispute standard `research/reversal-authority-patterns.md` Q5 found in CBN's framework) is a target the ops process is measured against, not a rule that makes IdentityApi reject an old reversal request. Options considered: reject a reversal request past some age limit; no code enforcement. **Confirmed: no code enforcement.**
+
+### 8.8 What this still does not settle
+
+- **The ops channel itself** — its maker-checker UI/process, how it authenticates its own internal users, what evidence it requires before calling IdentityApi — does not exist and is not designed here. It is out of GARBATI's current scope entirely, tracked nowhere yet.
+- **The actual recovery process** behind a `ReversalOutcomes` row — demand notices, watch-listing, legal/criminal referral, when the recoverable phase formally ends and becomes a write-off — is not designed. Section 8.6's entity is only the audit record of that process's conclusion, not the process.
+- **CBN-specific timing figures** in `research/reversal-authority-patterns.md` (instant-EFT dispute windows, lien duration, watch-listing timelines) are flagged there as needing compliance confirmation against the live circular before any real SLA relies on them — not re-verified here.
+- **Sharia framing of a write-off.** `research/reversal-authority-patterns.md` flags Qard Hasan (an interest-free benevolent loan) and Ibra (a voluntary debt rebate) as Islamic-finance concepts potentially relevant to how a `WriteOff` outcome should be framed, especially toward a customer in genuine hardship rather than a fraud actor. Not resolved here — a qualified Sharia scholar must weigh in before this is presented to a customer as final, not just recorded internally.
 
 ---
 
@@ -512,8 +576,14 @@ Numbering continues from the original v1 draft (1–18). New v2 decisions are 19
 | 25 | Approval single-use/replay | Reusable across requests; bound to one request only | **Confirmed, 16 Oct 2026: single-use, request-bound** — the same no-replay principle already established for the machine-issued grant (#7), applied one layer earlier to the human approval step. |
 | 26 | Key-compromise procedure | Assume covered by planned rotation; document as a separate, faster procedure | **Confirmed, 16 Oct 2026: a separate, explicit "stop trusting this `kid` immediately" procedure, distinct from scheduled rotation (4.3.2).** Exact operational mechanism is an implementation detail for the builder. |
 | 27 | Decision-token verification timing (LedgerApi decision #47) | Build it before anything ships; ship the demo without it first | **Confirmed (`garbati-platform` D-6), 16 Oct 2026: ship the demo without it, documented as a known limitation, build #47 once OrchestratorApi exists.** IdentityApi still issues real signed grants from day one — only LedgerApi's verification step is deferred. |
-| 28 | Reversal authority, reason codes, reconciliation | Decide now; defer to a dedicated task | **Deferred, 16 Oct 2026, to `garbati-platform` T-015** — not a decision made in this document. See Section 8. |
-| 29 | Idempotency on customer creation | None; client key + request hash | **Confirmed, 16 Oct 2026: client-supplied `idempotencyKey` + request hash, mirroring LedgerApi decision #43.** `POST /v1/customers` requires an `idempotencyKey`, scoped to the calling client; a retry with the same key and a matching hash of the other fields returns the originally-created customer; the same key with a different hash is rejected (409). | OrchestratorApi's own design (`Garbati.OrchestratorApi/docs/DESIGN.md` Section 1.4) already assumed this guarantee exists — it derives `orch:{operationId}:create-customer` as a retry-safe key for calling this endpoint. Without it, a timed-out create-customer call that gets retried could create a duplicate customer. This was deliberately left out of T-016's first build as an open question (see that PR) rather than assumed; the owner has now confirmed it belongs here. **Numbering note (corrected 17 Oct 2026):** this document's body prose (Sections 1–7) previously cited decision numbers that didn't match this table — a pre-existing authoring error from when this table was first written, not something introduced by T-016's PR. Every body citation has been corrected to point at the table row it actually describes; this is the only decision this document assigns the number 29 to. |
+| 28 | Reversal authority, reason codes, reconciliation | Decide now; defer to a dedicated task | **Deferred, 16 Oct 2026, to `garbati-platform` T-015 — resolved 18 Oct 2026, decisions #30–#35 below.** See Section 8. |
+| 29 | Idempotency on customer creation | None; client key + request hash | **Confirmed, 16 Oct 2026: client-supplied `idempotencyKey` + request hash, mirroring LedgerApi decision #43.** `POST /v1/customers` requires an `idempotencyKey`, scoped to the calling client; a retry with the same key and a matching hash of the other fields returns the originally-created customer; the same key with a different hash is rejected (409). OrchestratorApi's own design (`Garbati.OrchestratorApi/docs/DESIGN.md` Section 1.4) already assumed this guarantee exists — it derives `orch:{operationId}:create-customer` as a retry-safe key for calling this endpoint. **Numbering note (corrected 17 Oct 2026):** this document's body prose (Sections 1–7) previously cited decision numbers that didn't match this table — a pre-existing authoring error from when this table was first written. Every body citation has been corrected to point at the table row it actually describes. |
+| 30 | Reversal-authorization caller | Build dual-control inside IdentityApi (mirroring T-018's joint-approval workflow); trust a single restricted ops-channel caller | **Confirmed, 18 Oct 2026: trust a single ops-channel caller**, gated by new scope `identity.ops.reversal`, never granted to a customer-facing channel. Maker-checker for reversals happens inside the ops channel's own tooling, which does not exist yet and is not designed here. See 8.1. |
+| 31 | Does a reversal need the account's own mandate/joint-approval consent? | Inherit the account's `RequiredApprovals`; a lower bar (e.g. any one holder); ops override, bypasses the mandate model entirely | **Confirmed, 18 Oct 2026: ops override.** `research/reversal-authority-patterns.md` Q2 found no standard source answering this — a genuine gap, resolved here by the owner's choice rather than external precedent. See 8.2. |
+| 32 | Reversal reason codes | Invent GARBATI-specific codes; reuse ISO 20022/card-network vocabulary | **Confirmed, 18 Oct 2026: `DUPL`/`TECH`/`FRAD`/`CUST`/`UNAUTH`**, reusing converged industry categories (`research/reversal-authority-patterns.md` Q3) plus one GARBATI-specific addition (`UNAUTH`) where no ISO code maps to a consumer claim. `DISPUTE` (card-network-style consumer dispute) deliberately deferred until a real financing/merchant product exists. See 8.4. |
+| 33 | Reversal grant shape | A reversal-specific token/grant shape; reuse the existing grant machinery with a new `operation` value | **Confirmed, 18 Oct 2026: reuse**, unchanged `GrantSigner`/claim/expiry/signing logic, `operation: "Reversal"` plus the reason code as an added claim. See 8.5. |
+| 34 | Reversal outcome / write-off tracking | No tracking in IdentityApi (leave fully to ops tooling); track a distinct write-off event | **Confirmed, 18 Oct 2026: track it** — new `ReversalOutcomes` entity (`AuthorizationDecisionId`, `Outcome` `Completed`/`WriteOff`, `RecordedAt`, `RecordedBy`, `Notes`), a thin audit record of the recovery decision's conclusion, not the recovery process itself. The owner chose this over the research's more conservative "fully out of scope" recommendation. See 8.6. |
+| 35 | Reversal response-time enforcement | Reject a reversal request past some age limit; no code enforcement | **Confirmed, 18 Oct 2026: no code enforcement.** Timestamps are recorded exactly as for any other authorization decision; any real SLA is an ops-process target measured against them, not an IdentityApi rule. See 8.7. |
 
 ---
 
@@ -521,17 +591,18 @@ Numbering continues from the original v1 draft (1–18). New v2 decisions are 19
 
 Resolve these before production use; some can remain implementation tasks for the first build iteration.
 
-1. **Reversal authority (T-015).** See Section 8. The single highest-priority open item against real financial-loss risk.
-2. **Financial limits.** Which component authoritatively enforces per-transaction and aggregate/daily limits? Any concurrent aggregate limits must be enforced with appropriate atomicity.
-3. **KYC provider and Nigerian tier limits.** Which provider or manual workflow supplies verification results? The actual tier evidence/limits still need compliance confirmation (`research/nigerian-regulatory-requirements.md`).
-4. **Grant contract finalization.** Canonical amount encoding, operation names, token type/version, clock-skew policy and error codes — ready to implement per Section 3, but not yet exercised against real signing keys.
-5. **Channel identity mapping.** Define how authenticated channel identities map to the internal `CustomerId` so callers cannot choose another customer's identity by editing request fields. This is a textbook **BOLA** (Broken Object Level Authorization) risk — OWASP's #1-ranked API security risk — and is correctly flagged as open, not solved, per `research/identityapi-design-review.md` Q5.
-6. **Performance.** Set and test latency targets, timeout budgets and bounded retry policies, including validating the 30-second grant window against real measured latency before finalizing it (`research/identityapi-design-review.md` Q1).
-7. **Retention and privacy.** Approve encryption, access controls, retention, correction and deletion rules for identity information and verification evidence.
-8. **Deceased joint holder's share.** 2.1 explicitly does not auto-freeze a joint account when only one of several holders dies — estate/succession handling for that holder's share is an operations/legal process not designed here.
-9. **Sharia confirmation on joint-account equal ownership (AAOIFI).** AAOIFI's Sharia standards describe a joint account as equally owned by its holders by default unless they agree otherwise. Whether a disproportionate approval scheme (e.g. one holder able to act alone on an account with unequal contributions) is appropriate for a Sharia-compliant GARBATI account is a question for a qualified Sharia scholar/board — not resolved by this document or by `research/joint-account-approval-patterns.md`, which only flagged it.
-10. **CBN GSI confirmation on joint-account signatory identification.** CBN's Global Standing Instruction guidelines require identifying and obtaining evidence for all signatories to a joint account, and executing GSI mandates with all signatories' execution. No CBN-specific rule on approval-*threshold mechanics* was found; a compliance officer must confirm before production.
-11. **Token passthrough / confused-deputy naming.** The `aud` claim and LedgerApi's audience check (once #47 is built) are the right defense against a grant meant for one consumer being accepted by a different one, should the platform ever run more than one LedgerApi-equivalent or Orchestrator — name this explicitly in that future design rather than relying on `aud` being understood as the full mitigation (`research/identityapi-design-review.md` Q5).
+1. **The ops channel itself (Section 8.8).** Reversal authorization (Section 8) assumes a trusted ops channel exists, with its own maker-checker process. That channel is not designed and does not exist — it is the next real dependency for reversal to be usable in practice, not just authorizable in principle.
+2. **The actual reversal-recovery process (Section 8.8).** `ReversalOutcomes` (8.6) only records that a recovery decision concluded, not how — demand notices, watch-listing, legal/criminal referral, and the point at which a recoverable claim becomes a formal write-off are all undesigned operations/compliance work.
+3. **Financial limits.** Which component authoritatively enforces per-transaction and aggregate/daily limits? Any concurrent aggregate limits must be enforced with appropriate atomicity.
+4. **KYC provider and Nigerian tier limits.** Which provider or manual workflow supplies verification results? The actual tier evidence/limits still need compliance confirmation (`research/nigerian-regulatory-requirements.md`).
+5. **Grant contract finalization.** Canonical amount encoding, operation names, token type/version, clock-skew policy and error codes — ready to implement per Section 3, but not yet exercised against real signing keys.
+6. **Channel identity mapping.** Define how authenticated channel identities map to the internal `CustomerId` so callers cannot choose another customer's identity by editing request fields. This is a textbook **BOLA** (Broken Object Level Authorization) risk — OWASP's #1-ranked API security risk — and is correctly flagged as open, not solved, per `research/identityapi-design-review.md` Q5.
+7. **Performance.** Set and test latency targets, timeout budgets and bounded retry policies, including validating the 30-second grant window against real measured latency before finalizing it (`research/identityapi-design-review.md` Q1).
+8. **Retention and privacy.** Approve encryption, access controls, retention, correction and deletion rules for identity information and verification evidence.
+9. **Deceased joint holder's share.** 2.1 explicitly does not auto-freeze a joint account when only one of several holders dies — estate/succession handling for that holder's share is an operations/legal process not designed here.
+10. **Sharia confirmation on joint-account equal ownership (AAOIFI).** AAOIFI's Sharia standards describe a joint account as equally owned by its holders by default unless they agree otherwise. Whether a disproportionate approval scheme (e.g. one holder able to act alone on an account with unequal contributions) is appropriate for a Sharia-compliant GARBATI account is a question for a qualified Sharia scholar/board — not resolved by this document or by `research/joint-account-approval-patterns.md`, which only flagged it.
+11. **CBN GSI confirmation on joint-account signatory identification.** CBN's Global Standing Instruction guidelines require identifying and obtaining evidence for all signatories to a joint account, and executing GSI mandates with all signatories' execution. No CBN-specific rule on approval-*threshold mechanics* was found; a compliance officer must confirm before production.
+12. **Token passthrough / confused-deputy naming.** The `aud` claim and LedgerApi's audience check (once #47 is built) are the right defense against a grant meant for one consumer being accepted by a different one, should the platform ever run more than one LedgerApi-equivalent or Orchestrator — name this explicitly in that future design rather than relying on `aud` being understood as the full mitigation (`research/identityapi-design-review.md` Q5).
 
 ---
 
