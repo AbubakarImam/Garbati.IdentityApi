@@ -203,6 +203,40 @@ public class MandateService(IdentityDbContext dbContext, IAuditLogger auditLogge
             Details = $"reason: {request.Reason}",
         });
 
+        // T-018 decision #24 (the eager half - the live re-check at threshold-completion time,
+        // JointApprovalService, is the other half): every Pending PendingApprovalRequest on this same
+        // account where this customer has a non-voided ApprovalRecord gets that approval voided now, in
+        // the SAME SaveChangesAsync call as the revoke itself - not a separate transaction, and not left
+        // to the next time someone happens to look.
+        //
+        // Scoped narrowly to this method, matching the task file exactly ("MandateService's revoke path
+        // ... must now also"). CustomerService.CascadeMandateRevocationAndFreezeAsync (the Closed/Deceased
+        // cascade) also revokes mandates directly, through a different code path this method does not
+        // touch, and does NOT perform this same voiding - flagged as a gap in the PR rather than silently
+        // expanding this task's scope to a method the task file does not name.
+        var outstandingApprovals = await dbContext.ApprovalRecords
+            .Include(a => a.PendingApprovalRequest)
+            .Where(a => a.CustomerId == mandate.Customer.CustomerId
+                     && a.VoidedAt == null
+                     && a.PendingApprovalRequest.LedgerAccountId == mandate.LedgerAccountId
+                     && a.PendingApprovalRequest.Status == PendingApprovalRequestStatus.Pending)
+            .ToListAsync(cancellationToken);
+
+        foreach (var approval in outstandingApprovals)
+        {
+            approval.VoidedAt = now;
+            approval.VoidedReason = $"Mandate '{mandate.MandateId}' revoked: {request.Reason}";
+
+            auditLogger.Record(new AuditEvent
+            {
+                Action = AuditActions.ApprovalVoided,
+                EntityType = nameof(PendingApprovalRequest),
+                EntityId = approval.PendingApprovalRequest.RequestId,
+                Status = approval.PendingApprovalRequest.Status.ToString(),
+                Details = $"CustomerId {mandate.Customer.CustomerId}; reason: {approval.VoidedReason}",
+            });
+        }
+
         await dbContext.SaveChangesAsync(cancellationToken);
         return ToResponse(mandate, mandate.Customer.CustomerId);
     }
