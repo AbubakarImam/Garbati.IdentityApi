@@ -181,6 +181,29 @@ public class ReversalAuthorizationServiceTests(PostgresFixture fixture) : IAsync
         Assert.Equal(30, exp - iat);
     }
 
+    // QA follow-up: AuthorizationRequestValidator accepts ReasonCode case-insensitively
+    // (Enum.TryParse(..., ignoreCase: true)), so "dupl" is validly accepted input - but Section 8.4
+    // intends a fixed vocabulary, and a future consumer doing an exact string match against "DUPL" must
+    // not silently miss a validly accepted lowercase/mixed-case variant. Proves the raw caller-supplied
+    // casing never reaches either the signed grant's claim or the persisted AuthorizationDecision -
+    // both must show the canonical enum name, not an echo of whatever casing the caller happened to send.
+    [Fact]
+    public async Task RequestReversalAsync_NormalizesTheReasonCodesCasing_InTheGrantClaimAndThePersistedDecision()
+    {
+        await using var ctx = fixture.CreateContext();
+        var response = await CreateService(ctx).RequestReversalAsync(ReversalRequest(reasonCode: "dUpL"));
+
+        var handler = new JsonWebTokenHandler();
+        var jwt = handler.ReadJsonWebToken(response.Grant);
+        Assert.Equal("DUPL", jwt.GetClaim("reasonCode").Value);
+        Assert.Equal("DUPL", response.Decision.ReasonCode);
+
+        await using var verifyCtx = fixture.CreateContext();
+        var decision = await verifyCtx.AuthorizationDecisions.AsNoTracking()
+            .SingleAsync(d => d.DecisionId == response.Decision.DecisionId);
+        Assert.Equal("DUPL", decision.ReasonCode);
+    }
+
     [Fact]
     public async Task RequestReversalAsync_PersistsTheDecision_WithTheReasonCode()
     {

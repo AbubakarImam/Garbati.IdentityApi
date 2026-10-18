@@ -55,6 +55,16 @@ public class ReversalAuthorizationService(
         var originalTransactionReference = request.DebitAccountId;
         var creditAccountId = request.CreditAccountId ?? originalTransactionReference;
 
+        // QA fix: AuthorizationRequestValidator accepts any casing (Enum.TryParse(..., ignoreCase: true))
+        // so "dupl"/"Dupl"/"DUPL" are all valid input, but Section 8.4 intends a fixed vocabulary - a
+        // future consumer doing an exact string match against "DUPL" must not silently miss a validly
+        // accepted lowercase variant. Normalize to the enum's own canonical name once, here, before it is
+        // either persisted or placed in the grant claim - every other use of ReasonCode in this method
+        // reads from this normalized value, never request.ReasonCode directly. Validator already
+        // guarantees this parses for a Reversal request, so a parse failure here would mean the validator
+        // itself has a bug, not a legitimate "no reason code" case.
+        var reasonCode = Enum.Parse<ReversalReasonCode>(request.ReasonCode!, ignoreCase: true).ToString();
+
         var grant = grantSigner.Sign(new GrantClaims(
             Jti: decisionId,
             Sub: request.RequestedBy,
@@ -67,7 +77,7 @@ public class ReversalAuthorizationService(
             MandateId: null, // decision #31: no mandate backs a reversal authorization.
             IssuedAt: now,
             ExpiresAt: expiresAt,
-            ReasonCode: request.ReasonCode));
+            ReasonCode: reasonCode));
 
         var decision = new AuthorizationDecision
         {
@@ -80,7 +90,7 @@ public class ReversalAuthorizationService(
             Currency = request.Currency,
             IdempotencyKey = request.IdempotencyKey,
             MandateId = null,
-            ReasonCode = request.ReasonCode,
+            ReasonCode = reasonCode,
             Approved = true,
             DenialReason = null,
             CreatedAt = now,
@@ -98,7 +108,7 @@ public class ReversalAuthorizationService(
             EntityType = nameof(AuthorizationDecision),
             EntityId = decisionId,
             Status = "Approved",
-            Details = $"operation: Reversal; reasonCode: {request.ReasonCode}; reference: {originalTransactionReference}",
+            Details = $"operation: Reversal; reasonCode: {reasonCode}; reference: {originalTransactionReference}",
         });
 
         await dbContext.SaveChangesAsync(cancellationToken);
