@@ -730,3 +730,107 @@ them later.
   force this task to revisit it — is renamed to
   `CloseCustomerAsync_WritesNoOutboxMessage_WhenTheCustomerHasNoMandates` and still asserts zero rows for
   that one case; new tests cover the sole-holder (one row) and surviving-joint-holder (zero rows) cases.
+
+---
+
+## Appendix D. T-018 build notes (joint-account multi-approval workflow)
+
+This appendix records what the third build task (`garbati-platform` T-018) actually built against
+Section 3.8, continuing Appendix B/C's `#TBD-n` numbering convention. It does not change any ratified
+decision above.
+
+**Built:** `PendingApprovalRequests` and `ApprovalRecords` (3.8.2), with `Kind` (`Debit`/`ThresholdChange`)
+and `Status` (`Pending`/`Approved`/`Expired`/`Cancelled`) check constraints and a unique
+`(PendingApprovalRequestId, CustomerId)` index enforced by the database. `POST /v1/authorization/requests`
+now branches on `MandateApprovalPolicy.RequiredApprovals` (`JointApprovalService.RequestDebitAsync`);
+`RequiredApprovals <= 1` delegates unchanged to T-017's `AuthorizationService.RequestAuthorizationAsync`.
+New `POST /v1/authorization/requests/{id}/approve`, `GET /v1/accounts/{ledgerAccountId}/approval-policy`
+and `POST /v1/accounts/{ledgerAccountId}/approval-policy/change-requests`. The lazy expiry check (3.8.3)
+and both halves of decision #24 (eager void on `MandateService.RevokeMandateAsync`, live re-check at
+threshold-completion in `JointApprovalService.ApproveAsync`). One EF migration
+(`AddJointApprovalWorkflow`) and a migration test. The `RequiredApprovals == 1` path's existing behavior
+and tests (`AuthorizationServiceTests.cs`) are untouched - zero diff, confirmed by `git diff --stat`
+against the T-017 merge.
+
+- **`#TBD-18` (where the ThresholdChange request's desired new value lives).** Section 3.8.2's
+  `PendingApprovalRequest` field list (`LedgerAccountId`, `RequestedBy`, `Kind`, `Operation`,
+  `DebitAccountId`, `CreditAccountId`, `Amount`, `Currency`, `IdempotencyKey`, `RequiredApprovals`,
+  `Status`, `CreatedAt`, `ExpiresAt`) has no field for the number a `ThresholdChange` request is actually
+  proposing - `RequiredApprovals` itself is forced to the account's current active-holder count (3.8.4),
+  a different number. T-018 added `RequestedRequiredApprovals` (nullable, `ThresholdChange`-only) to hold
+  it. Without this field the feature described in 3.8.4 cannot be built at all; this is flagged as an
+  addition to the schema the design document did not itself specify, not a guess at a ratified decision.
+- **`#TBD-19` (POST /v1/authorization/requests' response shape, once it can branch).** Section 5.1 says a
+  joint account's response is "the pending request's id and status, not a grant yet" but does not define
+  a combined response contract. T-018 kept `AuthorizationResponse` (T-017, unchanged) for the immediate-
+  grant case and added `PendingApprovalRequestResponse` for the pending case, with the controller
+  returning whichever one actually applies (`DebitRequestResult`, a discriminated union) rather than one
+  response type with nullable fields standing in for "no grant yet" vs. "something went wrong."
+- **`#TBD-20` (where the one-time grant is returned for a joint-account debit).** Nothing in 3.8 says
+  which HTTP response actually carries the grant once the threshold is met - by construction it can only
+  be the response to the exact `.../approve` call that completes the threshold (decision #13 forbids
+  persisting/re-serving it, so there is no other channel to deliver it through). T-018 added a nullable
+  `Grant` field to `PendingApprovalRequestResponse`, populated only on that one response; `GET
+  .../requests/{id}` never populates it, even after the request is `Approved` (tested:
+  `GetPendingRequestAsync_NeverReturnsTheGrant_EvenAfterTheRequestIsApproved`).
+- **`#TBD-21` (approval-policy endpoints' scopes).** Section 5.2 enumerates scopes for every T-016/T-017
+  endpoint and explicitly says `identity.authorization.check` covers both `POST /v1/authorization/requests`
+  and `.../approve`, but says nothing about the two new `.../approval-policy[/change-requests]` endpoints
+  this task adds. T-018 chose `identity.mandate.read` for the `GET` (the same concern as the existing `GET
+  .../mandates`) and `identity.authorization.check` for the `POST` (it opens a `PendingApprovalRequest`,
+  "the same customer-facing authorization concern" Section 5.2 already uses to justify that scope).
+  Flagging for the owner/coordinator to confirm or correct.
+- **`#TBD-22` (a Debit request's REQUESTER becoming ineligible between creation and threshold
+  completion).** Section 3.8.2's `Status` enum (`Pending`/`Approved`/`Expired`/`Cancelled`) has no
+  "Denied" state, and 3.8.5/decision #24 only describes re-checking contributing *approvers'* mandates at
+  completion time - it does not say what happens if the fresh re-run of the requester's own eligibility
+  check (3.8.1 phase 2, "the ordinary single-holder authorization check... using the requester's own
+  eligibility as the basis") fails (e.g. their mandate was revoked, or their KYC tier no longer covers the
+  operation) while other holders were still approving. T-018 records the denial for audit/traceability
+  (the same `AuthorizationDecision` mechanism the single-holder path already uses) and leaves the request
+  `Pending` - the same observable outcome decision #24 specifies for a stale *approver*, applied here to a
+  stale *requester*. The approving holder whose call triggered the completion attempt still gets back a
+  normal `200 Pending` response, since their own approval was validly recorded and nothing about their
+  call failed.
+- **`#TBD-23` (the Closed/Deceased cascade does not get the eager-void treatment).** The task file scopes
+  decision #24's eager half narrowly: "`MandateService`'s revoke path ... must now also [void outstanding
+  approvals]." T-018 built exactly that, in `MandateService.RevokeMandateAsync`. `CustomerService.
+  CascadeMandateRevocationAndFreezeAsync` (T-016/T-017's `Closed`/`Deceased` cascade, 2.1) also revokes
+  mandates directly, through a different code path this task does not touch, and does **not** perform the
+  same voiding. A customer becoming `Closed`/`Deceased` with an outstanding approval on some other joint
+  account's `PendingApprovalRequest` would leave that approval un-voided by the eager mechanism (the live
+  re-check at threshold-completion, 3.8.5, would still catch it defensively if that request ever reaches
+  its threshold - so this is a gap in the eager half only, not a hole in decision #24 overall). Flagged
+  rather than silently expanding this task's scope to a method the task file does not name.
+- **`#TBD-24` (ThresholdChange request creation requires the requester to already be a holder).** Section
+  3.8.4 says approving a `ThresholdChange` request needs "every active holder['s]" consent and forces
+  `RequiredApprovals` to the active-holder count, but does not explicitly say the *requester* must
+  themselves be a current holder at creation time. T-018 added that check
+  (`JointApprovalService.RequestThresholdChangeAsync`, `JointApprovalDeniedException` with reason
+  `NoActiveMandate`): without it, `RequiredApprovals` could be forced to N while the requester's own
+  automatic first approval (decision #21's pattern, applied here too) comes from someone who isn't one of
+  the N holders, meaning fewer than every real holder could still reach the threshold - defeating decision
+  #22's whole point.
+- **`#TBD-25` (live re-check also voids what it finds, not just refuses to complete).** 3.8.5 says a stale
+  approval found at the live re-check means "the request's Status stays Pending ... and waits for a
+  replacement approval" but does not explicitly say whether the stale `ApprovalRecord` itself gets voided
+  at that moment or simply left alone (still counted as "given," just not re-verified again next time).
+  T-018 voids it immediately when the live re-check finds it stale, consistent with decision #24's own
+  "void immediately" language for the eager half, applied here to the moment the live check discovers
+  staleness rather than only to the moment a revoke call is made.
+- **`#TBD-26` (new exception-to-status-code mappings).** `PendingApprovalRequestNotFoundException`/
+  `ApprovalPolicyNotFoundException` → 404; `PendingApprovalRequestNotPendingException`/
+  `DuplicateApprovalException` → 409; `InvalidApprovalThresholdException` → 400 (the task file's own
+  words: "reject otherwise with a clear 400" - this is the one business-rule check in this task mapped to
+  400 rather than 422, because it genuinely is a request-shape bound, just one that needs a database read
+  the stateless validator cannot perform); `JointApprovalDeniedException` → 422, reusing
+  `AuthorizationDenialReasons`' existing reason codes rather than inventing new ones for the same
+  underlying facts (no active mandate, operation not permitted).
+- **Shared code, not duplicated (task file: "share code where natural").** `MandateEligibility.CheckAsync`
+  is T-017's customer/KYC/mandate eligibility logic, extracted byte-for-byte (same reason codes, same
+  order) into a static helper so `AuthorizationService.RequestAuthorizationAsync`'s constructor and every
+  existing call site - including every test in `AuthorizationServiceTests.cs` - needed no change.
+  `IssueApprovedGrantAsync`/`RecordDenialAsync` (new, additive methods on
+  `ITransactionAuthorizationService`) are the sign-and-persist / deny-and-persist halves of that same
+  method, reused by `JointApprovalService` once a request's threshold is met instead of being
+  re-implemented.
