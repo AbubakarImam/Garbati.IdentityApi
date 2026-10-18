@@ -18,6 +18,8 @@ public class IdentityDbContext(DbContextOptions<IdentityDbContext> options) : Db
     public DbSet<MandatePermission> MandatePermissions => Set<MandatePermission>();
     public DbSet<MandateApprovalPolicy> MandateApprovalPolicies => Set<MandateApprovalPolicy>();
     public DbSet<AuthorizationDecision> AuthorizationDecisions => Set<AuthorizationDecision>();
+    public DbSet<PendingApprovalRequest> PendingApprovalRequests => Set<PendingApprovalRequest>();
+    public DbSet<ApprovalRecord> ApprovalRecords => Set<ApprovalRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -151,6 +153,38 @@ public class IdentityDbContext(DbContextOptions<IdentityDbContext> options) : Db
         {
             entity.HasKey(d => d.Id);
             entity.HasIndex(d => d.DecisionId).IsUnique();
+        });
+
+        // DESIGN.md Section 3.8.2/7.1, T-018. RequestId is the public, nonce-equivalent identifier every
+        // approval is bound to (decision #25). LedgerAccountId is indexed, not unique - many requests
+        // (over time, or ThresholdChange alongside Debit) can exist for the same account.
+        modelBuilder.Entity<PendingApprovalRequest>(entity =>
+        {
+            entity.HasKey(r => r.Id);
+            entity.HasIndex(r => r.RequestId).IsUnique();
+            entity.HasIndex(r => r.LedgerAccountId);
+            entity.Property(r => r.Kind).HasConversion<string>();
+            entity.Property(r => r.Status).HasConversion<string>();
+            entity.ToTable(t => t.HasCheckConstraint(
+                "ck_pending_approval_requests_kind", "\"kind\" IN ('Debit', 'ThresholdChange')"));
+            entity.ToTable(t => t.HasCheckConstraint(
+                "ck_pending_approval_requests_status", "\"status\" IN ('Pending', 'Approved', 'Expired', 'Cancelled')"));
+        });
+
+        // DESIGN.md Section 3.8.2/7.4: the real constraint, not just application validation - a holder
+        // cannot approve the same request twice, and this is also how the requester's own implicit
+        // approval is represented (one row, created at the same time as the request).
+        modelBuilder.Entity<ApprovalRecord>(entity =>
+        {
+            entity.HasKey(a => a.Id);
+            entity.HasIndex(a => new { a.PendingApprovalRequestId, a.CustomerId })
+                .IsUnique()
+                .HasDatabaseName("ix_approval_records_request_customer");
+
+            entity.HasOne(a => a.PendingApprovalRequest)
+                .WithMany(r => r.Approvals)
+                .HasForeignKey(a => a.PendingApprovalRequestId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
     }
 }

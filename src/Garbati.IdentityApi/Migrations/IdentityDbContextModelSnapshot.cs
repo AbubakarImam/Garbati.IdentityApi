@@ -22,6 +22,46 @@ namespace Garbati.IdentityApi.Migrations
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
 
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.ApprovalRecord", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTimeOffset>("ApprovedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("approved_at");
+
+                    b.Property<string>("CustomerId")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("customer_id");
+
+                    b.Property<long>("PendingApprovalRequestId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("pending_approval_request_id");
+
+                    b.Property<DateTimeOffset?>("VoidedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("voided_at");
+
+                    b.Property<string>("VoidedReason")
+                        .HasColumnType("text")
+                        .HasColumnName("voided_reason");
+
+                    b.HasKey("Id")
+                        .HasName("pk_approval_records");
+
+                    b.HasIndex("PendingApprovalRequestId", "CustomerId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_approval_records_request_customer");
+
+                    b.ToTable("approval_records", (string)null);
+                });
+
             modelBuilder.Entity("Garbati.IdentityApi.Entities.AuditEvent", b =>
                 {
                     b.Property<long>("Id")
@@ -591,6 +631,114 @@ namespace Garbati.IdentityApi.Migrations
                         });
                 });
 
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.PendingApprovalRequest", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("Amount")
+                        .HasColumnType("text")
+                        .HasColumnName("amount");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("CreditAccountId")
+                        .HasColumnType("text")
+                        .HasColumnName("credit_account_id");
+
+                    b.Property<string>("Currency")
+                        .HasColumnType("text")
+                        .HasColumnName("currency");
+
+                    b.Property<string>("DebitAccountId")
+                        .HasColumnType("text")
+                        .HasColumnName("debit_account_id");
+
+                    b.Property<string>("DecisionId")
+                        .HasColumnType("text")
+                        .HasColumnName("decision_id");
+
+                    b.Property<DateTimeOffset>("ExpiresAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("IdempotencyKey")
+                        .HasColumnType("text")
+                        .HasColumnName("idempotency_key");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("kind");
+
+                    b.Property<string>("LedgerAccountId")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("ledger_account_id");
+
+                    b.Property<string>("Operation")
+                        .HasColumnType("text")
+                        .HasColumnName("operation");
+
+                    b.Property<string>("RequestId")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("request_id");
+
+                    b.Property<string>("RequestedBy")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("requested_by");
+
+                    b.Property<int?>("RequestedRequiredApprovals")
+                        .HasColumnType("integer")
+                        .HasColumnName("requested_required_approvals");
+
+                    b.Property<int>("RequiredApprovals")
+                        .HasColumnType("integer")
+                        .HasColumnName("required_approvals");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("status");
+
+                    b.HasKey("Id")
+                        .HasName("pk_pending_approval_requests");
+
+                    b.HasIndex("LedgerAccountId")
+                        .HasDatabaseName("ix_pending_approval_requests_ledger_account_id");
+
+                    b.HasIndex("RequestId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_pending_approval_requests_request_id");
+
+                    b.ToTable("pending_approval_requests", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_pending_approval_requests_kind", "\"kind\" IN ('Debit', 'ThresholdChange')");
+
+                            t.HasCheckConstraint("ck_pending_approval_requests_status", "\"status\" IN ('Pending', 'Approved', 'Expired', 'Cancelled')");
+                        });
+                });
+
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.ApprovalRecord", b =>
+                {
+                    b.HasOne("Garbati.IdentityApi.Entities.PendingApprovalRequest", "PendingApprovalRequest")
+                        .WithMany("Approvals")
+                        .HasForeignKey("PendingApprovalRequestId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_approval_records_pending_approval_requests_pending_approval");
+
+                    b.Navigation("PendingApprovalRequest");
+                });
+
             modelBuilder.Entity("Garbati.IdentityApi.Entities.CustomerIdentityData", b =>
                 {
                     b.HasOne("Garbati.IdentityApi.Entities.Customer", "Customer")
@@ -647,6 +795,11 @@ namespace Garbati.IdentityApi.Migrations
             modelBuilder.Entity("Garbati.IdentityApi.Entities.Mandate", b =>
                 {
                     b.Navigation("Permissions");
+                });
+
+            modelBuilder.Entity("Garbati.IdentityApi.Entities.PendingApprovalRequest", b =>
+                {
+                    b.Navigation("Approvals");
                 });
 #pragma warning restore 612, 618
         }
