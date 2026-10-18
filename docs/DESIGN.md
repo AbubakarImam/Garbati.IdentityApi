@@ -907,3 +907,89 @@ against the T-017 merge.
   `ITransactionAuthorizationService`) are the sign-and-persist / deny-and-persist halves of that same
   method, reused by `JointApprovalService` once a request's threshold is met instead of being
   re-implemented.
+
+---
+
+## Appendix E. T-020 build notes (reversal authorization)
+
+This appendix records what the fourth build task (`garbati-platform` T-020) actually built against
+Section 8 (decisions #30-#35), continuing Appendix B/C/D's `#TBD-n` numbering convention. It does not
+change any ratified decision above, and it deliberately does **not** build any `PendingApprovalRequest`-
+style workflow for reversals, any lien/auto-sweep mechanism, or a third `ReversalOutcomes` state - all
+three are explicitly out of scope per the task file and decision #30/#34 (reconfirmed by T-021).
+
+**Built:** scope `identity.ops.reversal` (`IdentityScopes`), wired into the dev-only `dev-ops` seed client
+(`appsettings.Development.json`) and nowhere else. `Operation = "Reversal"` on the existing
+`POST /v1/authorization/requests` contract, with a required `ReasonCode` validated against exactly
+`DUPL`/`TECH`/`FRAD`/`CUST`/`UNAUTH` (`ReversalReasonCode`, `AuthorizationRequestValidator`). A new,
+deliberately small `ReversalAuthorizationService` (not a variant of `JointApprovalService` or a reuse of
+`AuthorizationService.RequestAuthorizationAsync`/`IssueApprovedGrantAsync`) that signs the grant through the
+exact same `IGrantSigner`/`GrantClaims` shape and persists an ordinary `AuthorizationDecision` - with zero
+mandate/customer/KYC lookups of any kind, proven by three tests that put the same reversal request through
+a zero-mandate, single-holder, and 2-of-3 joint account and get the identical outcome from all three. New
+`ReversalOutcomes` table/entity (`Completed`/`WriteOff`, nothing else) and
+`POST /v1/authorization/requests/{id}/reversal-outcome`, scoped to `identity.ops.reversal`. One EF
+migration (`AddReversalAuthorization`) and migration/check-constraint tests mirroring prior tasks' style.
+
+- **`#TBD-27` (the original transaction/chain reference's field, Section 8.3).** The task file calls for
+  "a reference to the original transaction/chain being reversed, replacing debit/credit accounts for this
+  operation type" but does not define a new field for it, and decision #33 says the grant's claim shape
+  does not grow beyond the reason code. T-020 did not add a dedicated field: `DebitAccountId` carries that
+  single reference for a `Reversal` request (both in the request contract and in the resulting grant's
+  `debitAccountId` claim), and `CreditAccountId` - which has no meaning for a reversal - became nullable on
+  `AuthorizationRequest` (T-017's own `#TBD-8` had already flagged exactly this as the case that would
+  justify relaxing it: "revisit if/when an operation without a destination account is actually designed").
+  When the caller omits it, the grant's `creditAccountId` claim falls back to the same reference rather
+  than a required grant field going null. Flagged for the owner/coordinator to confirm this reading of
+  "replacing" is correct, rather than a new, dedicated reference field being added instead.
+- **`#TBD-28` (scope gating for `POST /v1/authorization/requests`, decision #30).** Every other endpoint
+  in this codebase gates on exactly one scope via a static `[Authorize(Policy = ...)]` attribute, checked
+  by `ControllerAuthorizationTests.EveryControllerAction_RequiresAKnownScopePolicy`. A `Reversal` request
+  needs `identity.ops.reversal` specifically - not `identity.authorization.check` - and the real `dev-ops`
+  seed client intentionally holds the former but not the latter (matching decision #30's "a single
+  restricted ops caller," not a caller that also happens to have ordinary transfer authority). Since
+  `[Authorize(Policy=...)]` is evaluated before the request body is even bound, a single static attribute
+  cannot choose between two scopes based on `Operation`'s value. `AuthorizationController.
+  RequestAuthorization` now checks the right scope explicitly (`User.HasClaim`, after the validator has
+  already confirmed `Operation` is well-formed) and returns `Forbid()` - which still produces the exact
+  same `ProblemDetails` 403 shape as a failed `[Authorize]`, since `ControllerBase.Forbid()` invokes the
+  same `ApiKeyAuthenticationHandler.HandleForbiddenAsync`. `ControllerAuthorizationTests` now carries a
+  single, named, commented exception for this one action, plus a new test proving it still isn't
+  anonymous. This is the one structural change this task made to an existing invariant test; flagged
+  explicitly rather than silently loosening it.
+- **`#TBD-29` (`GrantClaims.MandateId`/`ReasonCode`, decision #31/#33).** `MandateId` became nullable - a
+  reversal has no mandate behind it at all (decision #31), and leaving it an empty string or placeholder
+  would be a value a verifier could mistake for a real (if odd) mandate id. `GrantSigner` now omits the
+  `mandateId` claim from the token entirely when null, rather than encoding a null/placeholder value, so
+  every pre-T-020 grant's claim set is byte-for-byte unchanged (verified: `GrantSignerTests`'s existing
+  assertions pass unmodified). `ReasonCode` is a new, symmetric, nullable trailing claim added the same
+  way for the opposite case (present only for `Reversal`).
+- **`#TBD-30` (404 vs 409 for `.../reversal-outcome`, Section 8.6).** The task file explicitly left this
+  as the builder's call. T-020 chose: a decision id that does not exist at all → 404
+  (`AuthorizationDecisionNotFoundException`, a new exception - no existing one in this codebase covers
+  "no such `AuthorizationDecision`"). A decision that exists but was `Denied`, or whose `Operation` was not
+  `"Reversal"` → 409 (`ReversalOutcomeNotEligibleException`), matching the same "resource exists but wrong
+  state for this action" convention `PendingApprovalRequestNotPendingException` already established. A
+  second outcome on an already-recorded decision → 409 (`DuplicateReversalOutcomeException`), per the task
+  file's own instruction, matching `Mandates`/`Customer`'s `Closed`-style "terminal state" convention.
+- **`#TBD-31` (persisting `ReasonCode` on `AuthorizationDecision`, Section 8.5/8.6).** Decision #33 only
+  requires the reason code as a *grant claim* - it does not say to persist it on the `AuthorizationDecision`
+  row too. T-020 added the column anyway: the grant itself is never logged or persisted (decision #13), so
+  without this column the reason code would become permanently unrecoverable the moment the 30-second
+  grant expires, which seemed like the wrong trade for a field Section 6.3 lists among what gets audited.
+  Low-risk, additive, nullable for every non-`Reversal` decision; flagged in case the owner would rather
+  this live only in the audit `Details` string.
+- **`#TBD-32` (one audit event, not two, for a granted reversal, Section 6.3).** Section 6.3 lists "a
+  reversal authorization requested, the resulting grant issued or the denial" as things to audit, which
+  could read as two separate events per reversal. T-020 records exactly one (`AuditActions.
+  AuthorizationApproved`, the same action every other granted decision uses) per granted reversal, matching
+  the established one-event-per-decision pattern `AuthorizationService.PersistDecisionAsync` already uses
+  for every other operation - there is no separate request/decide phase to split apart here (decision
+  #30/#31's whole point: `ReversalAuthorizationService.RequestReversalAsync` is a single synchronous call
+  with no denial path once it is reached, unlike the T-018 `PendingApprovalRequest` lifecycle this
+  design document's own language echoes). `ReversalOutcomeRecorded` is the one genuinely new audit action.
+- **`ReversalReasonCode` kept out of `MandateOperation` (Section 2.2/8.4).** `Operation = "Reversal"` is
+  accepted by `AuthorizationRequestValidator` as a second, separate kind of operation string, not added as
+  a member of the `MandateOperation` enum (`View`/`Debit`/`Credit`) - that enum specifically describes what
+  a *mandate* can permit, and decision #31 means a reversal never touches a mandate at all. Adding
+  `Reversal` to it would have wrongly implied a mandate could someday be granted "Reversal" permission.
