@@ -221,6 +221,68 @@ public class CheckConstraintTests(PostgresFixture fixture) : IAsyncLifetime
         Assert.Equal("ix_approval_records_request_customer", ex.ConstraintName);
     }
 
+    // T-020, DESIGN.md Section 8.6/7.1, decision #34.
+    private async Task InsertApprovedReversalDecisionAsync(IdentityDbContext ctx, string decisionId)
+    {
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO authorization_decisions
+                (decision_id, requested_by, operation, debit_account_id, amount, currency, idempotency_key,
+                 reason_code, approved, created_at)
+            VALUES ({decisionId}, 'OPS-ACTOR', 'Reversal', 'TXN-1', '100', 'NGN', {decisionId}, 'FRAD', true, now())
+            """);
+    }
+
+    [Fact]
+    public async Task ReversalOutcome_WithUnknownOutcome_IsRejectedByTheDatabase()
+    {
+        await using var ctx = fixture.CreateContext();
+        await InsertApprovedReversalDecisionAsync(ctx, "DEC-REV-BADOUTCOME");
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO reversal_outcomes (authorization_decision_id, outcome, recorded_at, recorded_by)
+            VALUES ('DEC-REV-BADOUTCOME', 'Vanished', now(), 'test')
+            """));
+
+        Assert.Equal(PostgresErrorCodes.CheckViolation, ex.SqlState);
+        Assert.Equal("ck_reversal_outcomes_outcome", ex.ConstraintName);
+    }
+
+    // DESIGN.md Section 8.6: "at most one outcome per decision" - the real constraint, not just
+    // application validation (decision #19/#34's established pattern, applied here).
+    [Fact]
+    public async Task ReversalOutcome_SecondOutcomeForTheSameDecision_IsRejectedByTheDatabase()
+    {
+        await using var ctx = fixture.CreateContext();
+        await InsertApprovedReversalDecisionAsync(ctx, "DEC-REV-DUP");
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO reversal_outcomes (authorization_decision_id, outcome, recorded_at, recorded_by)
+            VALUES ('DEC-REV-DUP', 'Completed', now(), 'ops-user-1')
+            """);
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO reversal_outcomes (authorization_decision_id, outcome, recorded_at, recorded_by)
+            VALUES ('DEC-REV-DUP', 'WriteOff', now(), 'ops-user-2')
+            """));
+
+        Assert.Equal(PostgresErrorCodes.UniqueViolation, ex.SqlState);
+        Assert.Equal("ix_reversal_outcomes_authorization_decision_id", ex.ConstraintName);
+    }
+
+    // DESIGN.md Section 7.4: a real foreign key, not just an opaque string - unlike LedgerAccountId
+    // elsewhere in this schema, both tables live in the same database.
+    [Fact]
+    public async Task ReversalOutcome_ForANonexistentAuthorizationDecisionId_IsRejectedByTheDatabase()
+    {
+        await using var ctx = fixture.CreateContext();
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO reversal_outcomes (authorization_decision_id, outcome, recorded_at, recorded_by)
+            VALUES ('DEC-DOES-NOT-EXIST', 'Completed', now(), 'ops-user-1')
+            """));
+
+        Assert.Equal(PostgresErrorCodes.ForeignKeyViolation, ex.SqlState);
+    }
+
     [Fact]
     public async Task Mandate_TwoDifferentCustomers_CanEachHoldAnActiveMandateOnTheSameAccount()
     {
