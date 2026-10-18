@@ -163,6 +163,64 @@ public class CheckConstraintTests(PostgresFixture fixture) : IAsyncLifetime
         Assert.Equal(2, await ctx.Mandates.CountAsync(m => m.LedgerAccountId == "ACC-REISSUE"));
     }
 
+    // T-018, DESIGN.md Section 3.8.2/7.1.
+    [Fact]
+    public async Task PendingApprovalRequest_WithUnknownKind_IsRejectedByTheDatabase()
+    {
+        await using var ctx = fixture.CreateContext();
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO pending_approval_requests
+                (request_id, kind, ledger_account_id, requested_by, required_approvals, status, created_at, expires_at)
+            VALUES ('PAR-BADKIND', 'Transfer', 'ACC-1', 'CUS-1', 2, 'Pending', now(), now())
+            """));
+
+        Assert.Equal(PostgresErrorCodes.CheckViolation, ex.SqlState);
+        Assert.Equal("ck_pending_approval_requests_kind", ex.ConstraintName);
+    }
+
+    [Fact]
+    public async Task PendingApprovalRequest_WithUnknownStatus_IsRejectedByTheDatabase()
+    {
+        await using var ctx = fixture.CreateContext();
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO pending_approval_requests
+                (request_id, kind, ledger_account_id, requested_by, required_approvals, status, created_at, expires_at)
+            VALUES ('PAR-BADSTATUS', 'Debit', 'ACC-1', 'CUS-1', 2, 'Vanished', now(), now())
+            """));
+
+        Assert.Equal(PostgresErrorCodes.CheckViolation, ex.SqlState);
+        Assert.Equal("ck_pending_approval_requests_status", ex.ConstraintName);
+    }
+
+    // DESIGN.md Section 3.8.2: "a holder cannot approve the same request twice" - the real constraint,
+    // not just application validation (decision #19's pattern, applied here).
+    [Fact]
+    public async Task ApprovalRecord_SecondApprovalForTheSameRequestAndCustomer_IsRejectedByTheDatabase()
+    {
+        await using var ctx = fixture.CreateContext();
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO pending_approval_requests
+                (request_id, kind, ledger_account_id, requested_by, required_approvals, status, created_at, expires_at)
+            VALUES ('PAR-DUP', 'Debit', 'ACC-1', 'CUS-1', 2, 'Pending', now(), now())
+            """);
+        var requestPk = await ctx.PendingApprovalRequests.Where(r => r.RequestId == "PAR-DUP").Select(r => r.Id).SingleAsync();
+
+        await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO approval_records (pending_approval_request_id, customer_id, approved_at)
+            VALUES ({requestPk}, 'CUS-1', now())
+            """);
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => ctx.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO approval_records (pending_approval_request_id, customer_id, approved_at)
+            VALUES ({requestPk}, 'CUS-1', now())
+            """));
+
+        Assert.Equal(PostgresErrorCodes.UniqueViolation, ex.SqlState);
+        Assert.Equal("ix_approval_records_request_customer", ex.ConstraintName);
+    }
+
     [Fact]
     public async Task Mandate_TwoDifferentCustomers_CanEachHoldAnActiveMandateOnTheSameAccount()
     {

@@ -19,6 +19,8 @@ public class AuthorizationTests(ApiFixture fixture)
         {"requestedBy":"CUS-DOESNOTEXIST","operation":"Debit","debitAccountId":"ACC-1","creditAccountId":"ACC-2",
          "amount":100,"currency":"NGN","idempotencyKey":"auth-scope-test"}
         """;
+    private static string ApproveRequestBody() => """{"customerId":"CUS-DOESNOTEXIST"}""";
+    private static string ChangeApprovalPolicyBody() => """{"requestedBy":"CUS-DOESNOTEXIST","requiredApprovals":1}""";
 
     // Every endpoint with the one scope it requires. A non-existent customerId is fine: past
     // authorization the controller/service answers with 404 (or, for authorization requests, 422), not
@@ -39,6 +41,9 @@ public class AuthorizationTests(ApiFixture fixture)
         { "POST", "/v1/mandates/MND-DOESNOTEXIST/revoke", StatusChangeBody(), IdentityScopes.MandateWrite },
         { "POST", "/v1/authorization/requests", AuthorizationRequestBody(), IdentityScopes.AuthorizationCheck },
         { "GET", "/v1/authorization/requests/DOES-NOT-EXIST", null, IdentityScopes.AuthorizationCheck },
+        { "POST", "/v1/authorization/requests/DOES-NOT-EXIST/approve", ApproveRequestBody(), IdentityScopes.AuthorizationCheck },
+        { "GET", "/v1/accounts/ACC-DOESNOTEXIST/approval-policy", null, IdentityScopes.MandateRead },
+        { "POST", "/v1/accounts/ACC-DOESNOTEXIST/approval-policy/change-requests", ChangeApprovalPolicyBody(), IdentityScopes.AuthorizationCheck },
     };
 
     private static HttpRequestMessage Request(string method, string path, string? body)
