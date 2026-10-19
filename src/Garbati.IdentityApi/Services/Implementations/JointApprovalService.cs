@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using Garbati.IdentityApi.Auditing;
 using Garbati.IdentityApi.Contracts.Requests;
 using Garbati.IdentityApi.Contracts.Responses;
@@ -483,6 +484,68 @@ public class JointApprovalService(
 
         await dbContext.SaveChangesAsync(cancellationToken);
         return ToResponse(pendingRequest);
+    }
+
+    // T-031 (garbati-platform): a browsable queue of PendingApprovalRequest rows, for e.g. an ops-console
+    // approvals screen. Deliberately does NOT call ExpireIfPastDueAsync per row (unlike
+    // GetPendingRequestAsync) - the task file is explicit that this endpoint should not build "anything
+    // beyond a WHERE Status = @status filter"; lazy expiry on every row of every page would be exactly
+    // that kind of extra business logic, and would also make a read query mutate data as a side effect
+    // for however many rows happen to be stale on a given page. A request already past its ExpiresAt
+    // therefore keeps showing as Pending here until something else (a GET by id, or an approve attempt)
+    // touches it individually and flips it - a known, documented limitation, not a bug.
+    //
+    // Ordered oldest-first (ascending internal Id, which is monotonic with creation order, not RequestId
+    // which is a random GUID) - a queue is worked oldest-to-newest, the same convention a human approvals
+    // inbox would use. pageToken is opaque to the caller: base64 of the last row's Id on the page before.
+    // Requesting one extra row (pageSize + 1) tells us whether a further page exists without a second
+    // round trip.
+    public async Task<PagedResponse<PendingApprovalRequestResponse>> ListPendingRequestsAsync(
+        PendingApprovalRequestStatus status, int pageSize, string? pageToken, CancellationToken cancellationToken = default)
+    {
+        var afterId = DecodePageToken(pageToken);
+
+        var query = dbContext.PendingApprovalRequests.AsNoTracking()
+            .Include(r => r.Approvals)
+            .Where(r => r.Status == status);
+
+        if (afterId is { } cursor)
+        {
+            query = query.Where(r => r.Id > cursor);
+        }
+
+        var rows = await query.OrderBy(r => r.Id).Take(pageSize + 1).ToListAsync(cancellationToken);
+
+        var hasMore = rows.Count > pageSize;
+        var page = hasMore ? rows.Take(pageSize).ToList() : rows;
+
+        return new PagedResponse<PendingApprovalRequestResponse>(
+            page.Select(r => ToResponse(r)).ToList(),
+            hasMore ? EncodePageToken(page[^1].Id) : null);
+    }
+
+    private static string EncodePageToken(long id) =>
+        Convert.ToBase64String(Encoding.UTF8.GetBytes(id.ToString(CultureInfo.InvariantCulture)));
+
+    // Any pageToken that doesn't decode to the shape we ourselves produced is a client input error - a
+    // tampered or hand-written token is not "page not found" (404), it's a bad request (400), mapped via
+    // InvalidPageTokenException the same way InvalidApprovalThresholdException already maps a bad
+    // RequiredApprovals value to 400 (ExceptionHandlingMiddleware).
+    private static long? DecodePageToken(string? pageToken)
+    {
+        if (string.IsNullOrEmpty(pageToken))
+        {
+            return null;
+        }
+
+        try
+        {
+            return long.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(pageToken)), CultureInfo.InvariantCulture);
+        }
+        catch (Exception ex) when (ex is FormatException or OverflowException)
+        {
+            throw new InvalidPageTokenException($"'{pageToken}' is not a valid pageToken.");
+        }
     }
 
     // DESIGN.md Section 3.8.3/Section 5 (item 5 of the task file): checked lazily, whenever a request is

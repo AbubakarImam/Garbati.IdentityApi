@@ -81,6 +81,10 @@ public class ExceptionHandlingMiddleware(RequestDelegate next, ILogger<Exception
         AuthorizationDecisionNotFoundException => (StatusCodes.Status404NotFound, "Authorization decision not found."),
         ReversalOutcomeNotEligibleException => (StatusCodes.Status409Conflict, "This decision cannot accept a reversal outcome."),
         DuplicateReversalOutcomeException => (StatusCodes.Status409Conflict, "A reversal outcome has already been recorded for this decision."),
+
+        // T-031 addition (DESIGN.md Section 5.1): a malformed pageToken, same 400-via-exception pattern
+        // as InvalidApprovalThresholdException above.
+        InvalidPageTokenException => (StatusCodes.Status400BadRequest, "Invalid pageToken."),
         _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred.")
     };
 }

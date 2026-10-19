@@ -1,6 +1,7 @@
 using Garbati.IdentityApi.Authorization;
 using Garbati.IdentityApi.Contracts.Requests;
 using Garbati.IdentityApi.Contracts.Responses;
+using Garbati.IdentityApi.Entities;
 using Garbati.IdentityApi.Services;
 using Garbati.IdentityApi.Validation;
 using Microsoft.AspNetCore.Authorization;
@@ -28,6 +29,13 @@ public class AuthorizationController(
     ApproveRequestValidator approveValidator,
     RecordReversalOutcomeRequestValidator reversalOutcomeValidator) : ControllerBase
 {
+    // T-031 (garbati-platform): the task file's own suggested default/max - nothing in this platform has
+    // needed different values yet. Validated here (not in JointApprovalService) because neither check
+    // needs the database - same reasoning as every other validator on this controller living outside the
+    // service it feeds.
+    private const int DefaultPageSize = 20;
+    private const int MaxPageSize = 100;
+
     // T-018: branches on MandateApprovalPolicy.RequiredApprovals (DESIGN.md Section 5.1). The RequiredApprovals
     // <= 1 case is unchanged from T-017 - JointApprovalService.RequestDebitAsync delegates straight to
     // ITransactionAuthorizationService.RequestAuthorizationAsync for that branch, not reimplemented here.
@@ -125,5 +133,38 @@ public class AuthorizationController(
 
         var pending = await jointApprovalService.GetPendingRequestAsync(id, cancellationToken);
         return pending is null ? NotFound() : Ok(pending);
+    }
+
+    // T-031 (garbati-platform, D-15): a browsable queue of pending (or otherwise-statused) joint-approval
+    // requests, e.g. for an ops-console "approvals queue" screen (OpsApi/T-028, not built yet). Same scope
+    // as the GET-by-id action above - this is the same customer-facing authorization concern, read back as
+    // a list instead of by one id. Purely additive: does not touch RequestAuthorization, Approve,
+    // RecordReversalOutcome or GetAuthorizationRequest above.
+    //
+    // Deliberately scoped to PendingApprovalRequest only (JointApprovalService.ListPendingRequestsAsync's
+    // own comment) - a single-holder (RequiredApprovals <= 1) request never creates one of these rows at
+    // all, it resolves synchronously via AuthorizationDecision (see RequestAuthorization/RequestDebitAsync
+    // above), so it never appears here. This is "pending joint-approval requests," not "every
+    // authorization decision ever made."
+    [Authorize(Policy = IdentityScopes.AuthorizationCheck)]
+    [HttpGet]
+    public async Task<ActionResult> ListPendingRequests(
+        [FromQuery] string? status, [FromQuery] int? pageSize, [FromQuery] string? pageToken, CancellationToken cancellationToken)
+    {
+        var effectiveStatus = status ?? nameof(PendingApprovalRequestStatus.Pending);
+        if (!Enum.TryParse<PendingApprovalRequestStatus>(effectiveStatus, ignoreCase: true, out var parsedStatus))
+        {
+            return BadRequest($"'{status}' is not a recognized status.");
+        }
+
+        var effectivePageSize = pageSize ?? DefaultPageSize;
+        if (effectivePageSize < 1 || effectivePageSize > MaxPageSize)
+        {
+            return BadRequest($"pageSize must be between 1 and {MaxPageSize}.");
+        }
+
+        var response = await jointApprovalService.ListPendingRequestsAsync(
+            parsedStatus, effectivePageSize, pageToken, cancellationToken);
+        return Ok(response);
     }
 }
