@@ -1,5 +1,6 @@
 using Garbati.IdentityApi.Contracts.Requests;
 using Garbati.IdentityApi.Contracts.Responses;
+using Garbati.IdentityApi.Entities;
 
 namespace Garbati.IdentityApi.Services;
 
@@ -22,4 +23,14 @@ public interface IJointApprovalService
 
     Task<PendingApprovalRequestResponse> RequestThresholdChangeAsync(
         string ledgerAccountId, ChangeApprovalPolicyRequest request, CancellationToken cancellationToken = default);
+
+    // T-031 (garbati-platform): a browsable queue of PendingApprovalRequest rows for a given Status, for
+    // an ops-console "approvals queue" screen (there is no such screen yet - OpsApi/T-028 is the first
+    // intended caller). Deliberately scoped to PendingApprovalRequest only, same as GetPendingRequestAsync
+    // above - a single-holder (RequiredApprovals <= 1) request never creates a row here at all (it
+    // resolves synchronously via AuthorizationDecision, see RequestDebitAsync's own branch), so this never
+    // lists those. pageToken is the opaque cursor returned as PagedResponse.NextPageToken; null/omitted
+    // starts from the beginning.
+    Task<PagedResponse<PendingApprovalRequestResponse>> ListPendingRequestsAsync(
+        PendingApprovalRequestStatus status, int pageSize, string? pageToken, CancellationToken cancellationToken = default);
 }

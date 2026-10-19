@@ -805,4 +805,237 @@ public class JointApprovalServiceTests(PostgresFixture fixture) : IAsyncLifetime
             .SingleAsync(a => a.CustomerId == customerA && a.PendingApprovalRequest.RequestId == requestId);
         Assert.NotNull(aApprovalAfter.VoidedAt);
     }
+
+    // --- ListPendingRequestsAsync (T-031, garbati-platform) ------------------------------------------
+
+    [Fact]
+    public async Task ListPendingRequestsAsync_ReturnsAnEmptyPage_WhenNothingMatches()
+    {
+        await using var ctx = fixture.CreateContext();
+        var page = await CreateJointApprovalService(ctx).ListPendingRequestsAsync(
+            PendingApprovalRequestStatus.Pending, pageSize: 20, pageToken: null);
+
+        Assert.Empty(page.Items);
+        Assert.Null(page.NextPageToken);
+    }
+
+    [Fact]
+    public async Task ListPendingRequestsAsync_ReturnsMultiplePendingRequests_OldestFirst()
+    {
+        var customerA = await CreateCustomerAsync("Holder A List Order");
+        var customerB = await CreateCustomerAsync("Holder B List Order");
+        await AttachMandateAsync(customerA, "ACC-LIST-ORDER-1", "Debit");
+        await AttachMandateAsync(customerB, "ACC-LIST-ORDER-1", "Debit");
+        await SetRequiredApprovalsAsync("ACC-LIST-ORDER-1", 2, customerA, customerB);
+        await AttachMandateAsync(customerA, "ACC-LIST-ORDER-2", "Debit");
+        await AttachMandateAsync(customerB, "ACC-LIST-ORDER-2", "Debit");
+        await SetRequiredApprovalsAsync("ACC-LIST-ORDER-2", 2, customerA, customerB);
+
+        string firstRequestId;
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, "ACC-LIST-ORDER-1"));
+            firstRequestId = Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId;
+        }
+
+        string secondRequestId;
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, "ACC-LIST-ORDER-2"));
+            secondRequestId = Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId;
+        }
+
+        await using var listCtx = fixture.CreateContext();
+        var page = await CreateJointApprovalService(listCtx).ListPendingRequestsAsync(
+            PendingApprovalRequestStatus.Pending, pageSize: 20, pageToken: null);
+
+        // Oldest-first, documented in ListPendingRequestsAsync's own comment: the request created first
+        // must come first in the page, not last.
+        Assert.Equal([firstRequestId, secondRequestId], page.Items.Select(r => r.RequestId).ToList());
+        Assert.Null(page.NextPageToken);
+    }
+
+    [Fact]
+    public async Task ListPendingRequestsAsync_StatusFilter_ActuallyFilters()
+    {
+        var customerA = await CreateCustomerAsync("Holder A List Filter");
+        var customerB = await CreateCustomerAsync("Holder B List Filter");
+        await AttachMandateAsync(customerA, "ACC-LIST-FILTER", "Debit");
+        await AttachMandateAsync(customerB, "ACC-LIST-FILTER", "Debit");
+        await SetRequiredApprovalsAsync("ACC-LIST-FILTER", 2, customerA, customerB);
+
+        string stillPendingId;
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, "ACC-LIST-FILTER"));
+            stillPendingId = Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId;
+        }
+
+        string expiredId;
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, "ACC-LIST-FILTER"));
+            expiredId = Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId;
+        }
+
+        // Force the second request into the past (same technique as ExpiredRequest_GetShowsExpired
+        // above), then touch it via GetPendingRequestAsync so the lazy expiry actually persists Expired -
+        // ListPendingRequestsAsync itself deliberately does not run lazy expiry (its own comment).
+        await using (var ctx = fixture.CreateContext())
+        {
+            var pending = await ctx.PendingApprovalRequests.SingleAsync(r => r.RequestId == expiredId);
+            pending.ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+            await ctx.SaveChangesAsync();
+        }
+        await using (var ctx = fixture.CreateContext())
+        {
+            await CreateJointApprovalService(ctx).GetPendingRequestAsync(expiredId);
+        }
+
+        await using var listCtx = fixture.CreateContext();
+        var pendingPage = await CreateJointApprovalService(listCtx).ListPendingRequestsAsync(
+            PendingApprovalRequestStatus.Pending, pageSize: 20, pageToken: null);
+        var expiredPage = await CreateJointApprovalService(listCtx).ListPendingRequestsAsync(
+            PendingApprovalRequestStatus.Expired, pageSize: 20, pageToken: null);
+
+        Assert.Contains(pendingPage.Items, r => r.RequestId == stillPendingId);
+        Assert.DoesNotContain(pendingPage.Items, r => r.RequestId == expiredId);
+        Assert.Contains(expiredPage.Items, r => r.RequestId == expiredId);
+        Assert.DoesNotContain(expiredPage.Items, r => r.RequestId == stillPendingId);
+    }
+
+    // QA follow-up on PR #5: proves the query-level fix directly, without routing through
+    // GetPendingRequestAsync first (unlike the StatusFilter test above, which forces the real Expired
+    // transition before listing). Here the row's Status column is left as Pending in the database - this
+    // test is specifically about ListPendingRequestsAsync itself excluding a stale-but-still-Pending row,
+    // not about the lazy-expiry transition other endpoints perform.
+    [Fact]
+    public async Task ListPendingRequestsAsync_ExcludesAPendingRowPastItsExpiry_WithoutTouchingItsStatus()
+    {
+        var customerA = await CreateCustomerAsync("Holder A Stale Filter");
+        var customerB = await CreateCustomerAsync("Holder B Stale Filter");
+        await AttachMandateAsync(customerA, "ACC-STALE-FILTER", "Debit");
+        await AttachMandateAsync(customerB, "ACC-STALE-FILTER", "Debit");
+        await SetRequiredApprovalsAsync("ACC-STALE-FILTER", 2, customerA, customerB);
+
+        string staleId;
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, "ACC-STALE-FILTER"));
+            staleId = Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId;
+        }
+
+        // Push it past its expiry directly - deliberately NOT calling GetPendingRequestAsync or any other
+        // method that would run lazy expiry, so Status stays Pending in the database the whole time.
+        await using (var ctx = fixture.CreateContext())
+        {
+            var pending = await ctx.PendingApprovalRequests.SingleAsync(r => r.RequestId == staleId);
+            pending.ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+            await ctx.SaveChangesAsync();
+        }
+
+        await using var listCtx = fixture.CreateContext();
+        var pendingPage = await CreateJointApprovalService(listCtx).ListPendingRequestsAsync(
+            PendingApprovalRequestStatus.Pending, pageSize: 20, pageToken: null);
+
+        Assert.DoesNotContain(pendingPage.Items, r => r.RequestId == staleId);
+
+        await using var verifyCtx = fixture.CreateContext();
+        var stillPendingInDb = await verifyCtx.PendingApprovalRequests.SingleAsync(r => r.RequestId == staleId);
+        Assert.Equal(PendingApprovalRequestStatus.Pending, stillPendingInDb.Status);
+    }
+
+    [Fact]
+    public async Task ListPendingRequestsAsync_PagingActuallyPages_NoDuplicatesAndNoGaps()
+    {
+        var customerA = await CreateCustomerAsync("Holder A List Paging");
+        var customerB = await CreateCustomerAsync("Holder B List Paging");
+
+        var requestIds = new List<string>();
+        for (var i = 0; i < 5; i++)
+        {
+            var accountId = $"ACC-LIST-PAGE-{i}";
+            await AttachMandateAsync(customerA, accountId, "Debit");
+            await AttachMandateAsync(customerB, accountId, "Debit");
+            await SetRequiredApprovalsAsync(accountId, 2, customerA, customerB);
+
+            await using var ctx = fixture.CreateContext();
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, accountId));
+            requestIds.Add(Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId);
+        }
+
+        var seen = new List<string>();
+        string? pageToken = null;
+        var pagesFetched = 0;
+        do
+        {
+            await using var ctx = fixture.CreateContext();
+            var page = await CreateJointApprovalService(ctx).ListPendingRequestsAsync(
+                PendingApprovalRequestStatus.Pending, pageSize: 2, pageToken: pageToken);
+            seen.AddRange(page.Items.Select(r => r.RequestId));
+            pageToken = page.NextPageToken;
+            pagesFetched++;
+        } while (pageToken is not null && pagesFetched < 10); // bound the loop so a paging bug fails the test, not hangs it
+
+        // Exactly the 5 requests created, in the exact oldest-first order they were created - a real
+        // "page through everything" walk, not just "the first page looks right."
+        Assert.Equal(requestIds, seen);
+        Assert.Equal(3, pagesFetched); // 2 + 2 + 1
+    }
+
+    // --- Task file's explicit requirement: confirm a single-holder request (which resolves via
+    // AuthorizationDecision and never creates a PendingApprovalRequest row) does NOT appear here. ------
+
+    [Fact]
+    public async Task ListPendingRequestsAsync_NeverIncludesASingleHolderRequest_WhichNeverCreatesARow()
+    {
+        // Single-holder account (default RequiredApprovals = 1, never raised) - RequestDebitAsync grants
+        // immediately via AuthorizationDecision and never creates a PendingApprovalRequest row at all.
+        var soloCustomer = await CreateCustomerAsync("Solo Holder List Test");
+        await AttachMandateAsync(soloCustomer, "ACC-LIST-SOLO", "Debit");
+
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(soloCustomer, "ACC-LIST-SOLO"));
+            Assert.IsType<DebitRequestResult.Granted>(result);
+        }
+
+        // A genuine joint-approval Pending request, on a DIFFERENT account, so the list has something
+        // real to return - this proves the solo account is specifically and correctly absent, not just
+        // that the whole list happens to be empty.
+        var customerA = await CreateCustomerAsync("Holder A List Solo Test");
+        var customerB = await CreateCustomerAsync("Holder B List Solo Test");
+        await AttachMandateAsync(customerA, "ACC-LIST-JOINT", "Debit");
+        await AttachMandateAsync(customerB, "ACC-LIST-JOINT", "Debit");
+        await SetRequiredApprovalsAsync("ACC-LIST-JOINT", 2, customerA, customerB);
+
+        string jointRequestId;
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, "ACC-LIST-JOINT"));
+            jointRequestId = Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId;
+        }
+
+        await using var listCtx = fixture.CreateContext();
+        var page = await CreateJointApprovalService(listCtx).ListPendingRequestsAsync(
+            PendingApprovalRequestStatus.Pending, pageSize: 50, pageToken: null);
+
+        Assert.Contains(page.Items, r => r.RequestId == jointRequestId);
+        Assert.DoesNotContain(page.Items, r => r.LedgerAccountId == "ACC-LIST-SOLO");
+
+        // Belt-and-braces: confirm directly against the database that no PendingApprovalRequest row
+        // exists at all for the solo account - there is nothing this (or any) query could ever surface
+        // for it, not just that this particular page happened to omit it.
+        await using var verifyCtx = fixture.CreateContext();
+        Assert.Equal(0, await verifyCtx.PendingApprovalRequests.CountAsync(r => r.LedgerAccountId == "ACC-LIST-SOLO"));
+    }
+
+    [Fact]
+    public async Task ListPendingRequestsAsync_Throws_ForAMalformedPageToken()
+    {
+        await using var ctx = fixture.CreateContext();
+        await Assert.ThrowsAsync<InvalidPageTokenException>(() =>
+            CreateJointApprovalService(ctx).ListPendingRequestsAsync(
+                PendingApprovalRequestStatus.Pending, pageSize: 20, pageToken: "not-valid-base64!!!"));
+    }
 }
