@@ -325,6 +325,16 @@ This closes a documented real hazard: multisig implementations that do not expli
 
 The "never cache a positive authorization decision" rule (3.1, 4.1) applies to the *final* authorization check performed once the threshold is met — IdentityApi does not pre-approve or cache the outcome while still waiting on approvals. This does not mean the `PendingApprovalRequest`/`ApprovalRecord` rows themselves can't be stored (they must be, to track partial progress) — it means the actual authorize-and-sign decision is always made fresh, at the moment the threshold is satisfied, never reused from an earlier point in the same request's life.
 
+#### 3.8.7 Listing pending requests (T-031, `garbati-platform` D-15)
+
+`GET /v1/authorization/requests?status=&pageSize=&pageToken=` lists `PendingApprovalRequest` rows for a given `Status` (`Pending` by default — the useful case for an approvals queue; `Approved`/`Expired`/`Cancelled` are accepted too, for completeness, with no extra business logic beyond the status filter). Same scope as the rest of this controller (`identity.authorization.check`) — no new scope.
+
+**This endpoint is specifically "pending joint-approval requests," not "every authorization decision ever made."** A single-holder (`RequiredApprovals <= 1`) request never creates a `PendingApprovalRequest` row at all — 3.8.1's whole branch is that it resolves synchronously via the ordinary `AuthorizationDecision` path instead. A caller must not expect single-holder transfers to show up here; `GET /v1/authorization/requests/{id}` (by id) remains the only way to check a single-holder decision's status.
+
+**Ordering and paging.** Oldest-first (ascending internal `Id`, which is monotonic with creation order — not the public `RequestId`, which is a random identifier with no ordering meaning). `pageSize` defaults to 20, maximum 100 (validated in the controller, 400 outside that range). `pageToken` is an opaque cursor — base64 of the last row's internal `Id` on the previous page; a malformed token is a 400 (`InvalidPageTokenException`), not a 404. The response is `{ items: [...], nextPageToken: string | null }` (`PagedResponse<T>`) — checked against `LedgerApi` and `Garbati.OrchestratorApi` first; as of 19 Oct 2026 neither has any list endpoint yet, so there was no existing platform convention to reuse. This shape is intentionally generic so the next list endpoint on any Garbati service can reuse it.
+
+**Deliberately not done:** no lazy-expiry pass over listed rows (unlike the by-id `GetPendingRequestAsync`) — the task explicitly scopes this to a `WHERE Status = @status` filter, and running expiry on every row of every page would be exactly the kind of extra business logic that was ruled out, plus it would make a read mutate data depending on how many rows on the page happen to be stale. A request already past its `ExpiresAt` keeps showing as `Pending` here until something else (a by-id `GET`, or an approve attempt) touches it individually — a known, documented limitation, not a bug.
+
 ---
 
 ## 4. Consistency, performance and availability
@@ -382,6 +392,7 @@ Because grants expire after 30 seconds, participating services need synchronized
 | `POST /v1/authorization/requests` | **(v2, new)** A holder requests a debit on a joint account. Opens a `Debit`-kind `PendingApprovalRequest`, counting the requester's own approval (3.8.1). For a single-holder account (`RequiredApprovals = 1`) this immediately satisfies the threshold and behaves like v1's `POST /v1/authorization/check`. |
 | `POST /v1/authorization/requests/{id}/approve` | **(v2, new)** A different holder approves a pending request. |
 | `GET /v1/authorization/requests/{id}` | **(v2, new)** Status of a pending (or resolved) approval request — for the channel to poll or for a holder to check what they're being asked to approve. |
+| `GET /v1/authorization/requests?status=&pageSize=&pageToken=` | **(T-031, new)** A browsable, paged queue of **joint-approval** `PendingApprovalRequest` rows for a given `Status` (defaults to `Pending`), oldest-first. Scoped specifically to joint-approval requests — a single-holder (`RequiredApprovals <= 1`) request resolves synchronously via `AuthorizationDecision` and never creates a row here, so it never appears in this list. See Section 3.8.7. |
 
 `v1/authorization/check` from the original draft is superseded by `POST /v1/authorization/requests` — the new endpoint subsumes the old one's behavior for the ordinary single-holder case, so there is no separate "simple" endpoint to maintain alongside the joint-account one.
 
@@ -995,3 +1006,61 @@ migration (`AddReversalAuthorization`) and migration/check-constraint tests mirr
   a member of the `MandateOperation` enum (`View`/`Debit`/`Credit`) - that enum specifically describes what
   a *mandate* can permit, and decision #31 means a reversal never touches a mandate at all. Adding
   `Reversal` to it would have wrongly implied a mandate could someday be granted "Reversal" permission.
+
+## Appendix F. T-031 build notes (pending-requests list endpoint)
+
+This appendix records what `garbati-platform` T-031 actually built against the new Section 3.8.7: a
+single, purely additive, read-only `GET /v1/authorization/requests?status=&pageSize=&pageToken=` action on
+`AuthorizationController`, listing `PendingApprovalRequest` rows. It does not touch
+`RequestAuthorization`, `Approve`, `RecordReversalOutcome` or `GetAuthorizationRequest` - no existing
+endpoint, scope, route, or response shape changed.
+
+**Built:** `AuthorizationController.ListPendingRequests` (`[HttpGet]` at the controller's own base route,
+`[Authorize(Policy = IdentityScopes.AuthorizationCheck)]` - no new scope). Query-parameter validation
+(`status` defaulting to `Pending`; `pageSize` defaulting to 20, clamped to [1, 100]) lives in the
+controller, same as every other per-request shape check in this codebase. `IJointApprovalService.
+ListPendingRequestsAsync` does the actual query: `WHERE Status = @status`, ordered oldest-first by the
+row's internal `Id`, keyset-paged with an opaque base64-of-`Id` cursor. The existing
+`PendingApprovalRequestResponse` shape is reused exactly as-is (no second, list-specific shape). A new
+generic `PagedResponse<T>` record (`Contracts/Responses/PagedResponse.cs`) is the envelope - checked
+`LedgerApi` and `Garbati.OrchestratorApi` first; neither has any list endpoint yet (as of 19 Oct 2026), so
+there was no existing platform paging convention to reuse, and this one is written to be reusable by
+whichever lists those services add next. A new `InvalidPageTokenException`, mapped to 400 the same way
+`InvalidApprovalThresholdException` already is (`ExceptionHandlingMiddleware`).
+
+Tests (`JointApprovalServiceTests`): an empty page when nothing matches; multiple `Pending` requests
+returned oldest-first; the status filter actually excludes a request forced into `Expired` and vice
+versa; a full paged walk across 5 requests with `pageSize = 2` returns exactly those 5, in order, with no
+duplicates or gaps; a malformed `pageToken` throws. Plus the one test the task file called out explicitly,
+not just documented: a single-holder account's debit request (which grants immediately via
+`AuthorizationDecision` and never creates a `PendingApprovalRequest` row) is confirmed **absent** from the
+list, alongside a real joint-approval `Pending` request on a different account that correctly **is**
+present - both the positive and the negative case, not just the negative one in isolation.
+`ListPendingRequestsHttpTests` (new file, `[Collection("Api")]`) covers the query-parameter validation
+(`status`/`pageSize`/`pageToken` 400s) that only exists at the controller layer and so isn't exercised by
+calling the service directly - deliberately asserts nothing about response *content*, since the `Api`
+fixture's single shared Postgres instance is never reset between HTTP tests in the assembly (unlike the
+per-test-reset `Postgres` collection `JointApprovalServiceTests` uses), so another test's
+`PendingApprovalRequest` rows may already exist by the time this one runs.
+
+- **`#TBD-33` (ordering: oldest-first vs newest-first, task file item 2/Scope).** The task file explicitly
+  leaves this as the builder's call, only requiring it be picked and documented consistently. T-031 chose
+  oldest-first: an approvals queue is normally worked in the order requests arrived (the oldest unresolved
+  request is the most overdue one), the same intuition a human inbox or support-ticket queue uses. Flagged
+  for the owner/coordinator in case a future ops-console design (T-028/T-029) wants newest-first instead
+  (e.g. "show me what just came in") - that would be a one-line change to `ListPendingRequestsAsync`'s
+  `OrderBy`, not a reshape of the endpoint.
+- **`#TBD-34` (no lazy expiry on the list, Section 3.8.7).** `GetPendingRequestAsync` (by id) and `ApproveAsync`
+  both run `ExpireIfPastDueAsync` before answering, so a stale request is corrected on touch. The list
+  endpoint deliberately does not do this per row - the task file says not to build "anything beyond a
+  `WHERE Status = @status` filter," and running expiry across every row of every page would be both extra
+  business logic and a read endpoint with a write side effect of unpredictable size. The accepted
+  consequence: a `Pending` request already past `ExpiresAt` keeps appearing in this list as `Pending` until
+  something else touches it individually. Flagged in case an ops-console queue screen (the endpoint's own
+  motivating use case) finds this surprising enough to want a background expiry sweep instead - no such
+  sweep exists anywhere in this codebase today (Section 3.8.3 is already lazy-only by design), so adding
+  one would be new infrastructure, not a tweak to this task.
+- **`PagedResponse<T>` placement.** Added to `Contracts/Responses/`, not a new top-level `Contracts/Paging`
+  folder - it is a response shape like any other in that folder, just a generic one. If a second list
+  endpoint lands on this service (or another Garbati service copies the shape), this is the file to share
+  or mirror.
