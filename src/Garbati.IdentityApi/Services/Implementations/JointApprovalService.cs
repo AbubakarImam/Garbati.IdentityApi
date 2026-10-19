@@ -491,9 +491,17 @@ public class JointApprovalService(
     // GetPendingRequestAsync) - the task file is explicit that this endpoint should not build "anything
     // beyond a WHERE Status = @status filter"; lazy expiry on every row of every page would be exactly
     // that kind of extra business logic, and would also make a read query mutate data as a side effect
-    // for however many rows happen to be stale on a given page. A request already past its ExpiresAt
-    // therefore keeps showing as Pending here until something else (a GET by id, or an approve attempt)
-    // touches it individually and flips it - a known, documented limitation, not a bug.
+    // for however many rows happen to be stale on a given page. The Status column itself therefore still
+    // only flips to Expired when something else (a GET by id, or an approve attempt) touches a row
+    // individually - this method never writes anything.
+    //
+    // QA follow-up on this same PR: a Pending row already past its ExpiresAt would otherwise still show
+    // as "Pending" in this list (even though the Status column hasn't flipped yet), which would read as a
+    // phantom, actionable-looking entry in an ops queue that then fails the moment someone tries to act on
+    // it. Closed with a plain read-only addition to the query below (`ExpiresAt > now` whenever the caller
+    // asks for Pending) rather than a write - the displayed list and the real Status column can now
+    // legitimately disagree for a stale row (the row is still technically "Pending" in the database until
+    // something flips it), but this list no longer shows it as actionable.
     //
     // Ordered oldest-first (ascending internal Id, which is monotonic with creation order, not RequestId
     // which is a random GUID) - a queue is worked oldest-to-newest, the same convention a human approvals
@@ -508,6 +516,18 @@ public class JointApprovalService(
         var query = dbContext.PendingApprovalRequests.AsNoTracking()
             .Include(r => r.Approvals)
             .Where(r => r.Status == status);
+
+        // Closes the staleness gap QA flagged on this PR: a Pending row already past its ExpiresAt is
+        // still only lazily flipped to Expired by GetPendingRequestAsync/ApproveAsync touching it
+        // individually (490-496). Rather than leave an ops queue showing phantom "Pending" entries that
+        // would fail the moment someone acted on them, the Pending filter here also excludes anything
+        // already past due - a plain read-only WHERE-clause addition, not a write, so it doesn't cross
+        // the task file's "no extra business logic" line the way actually flipping Status here would.
+        if (status == PendingApprovalRequestStatus.Pending)
+        {
+            var now = DateTimeOffset.UtcNow;
+            query = query.Where(r => r.ExpiresAt > now);
+        }
 
         if (afterId is { } cursor)
         {

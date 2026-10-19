@@ -904,6 +904,47 @@ public class JointApprovalServiceTests(PostgresFixture fixture) : IAsyncLifetime
         Assert.DoesNotContain(expiredPage.Items, r => r.RequestId == stillPendingId);
     }
 
+    // QA follow-up on PR #5: proves the query-level fix directly, without routing through
+    // GetPendingRequestAsync first (unlike the StatusFilter test above, which forces the real Expired
+    // transition before listing). Here the row's Status column is left as Pending in the database - this
+    // test is specifically about ListPendingRequestsAsync itself excluding a stale-but-still-Pending row,
+    // not about the lazy-expiry transition other endpoints perform.
+    [Fact]
+    public async Task ListPendingRequestsAsync_ExcludesAPendingRowPastItsExpiry_WithoutTouchingItsStatus()
+    {
+        var customerA = await CreateCustomerAsync("Holder A Stale Filter");
+        var customerB = await CreateCustomerAsync("Holder B Stale Filter");
+        await AttachMandateAsync(customerA, "ACC-STALE-FILTER", "Debit");
+        await AttachMandateAsync(customerB, "ACC-STALE-FILTER", "Debit");
+        await SetRequiredApprovalsAsync("ACC-STALE-FILTER", 2, customerA, customerB);
+
+        string staleId;
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(DebitRequest(customerA, "ACC-STALE-FILTER"));
+            staleId = Assert.IsType<DebitRequestResult.Pending>(result).Response.RequestId;
+        }
+
+        // Push it past its expiry directly - deliberately NOT calling GetPendingRequestAsync or any other
+        // method that would run lazy expiry, so Status stays Pending in the database the whole time.
+        await using (var ctx = fixture.CreateContext())
+        {
+            var pending = await ctx.PendingApprovalRequests.SingleAsync(r => r.RequestId == staleId);
+            pending.ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+            await ctx.SaveChangesAsync();
+        }
+
+        await using var listCtx = fixture.CreateContext();
+        var pendingPage = await CreateJointApprovalService(listCtx).ListPendingRequestsAsync(
+            PendingApprovalRequestStatus.Pending, pageSize: 20, pageToken: null);
+
+        Assert.DoesNotContain(pendingPage.Items, r => r.RequestId == staleId);
+
+        await using var verifyCtx = fixture.CreateContext();
+        var stillPendingInDb = await verifyCtx.PendingApprovalRequests.SingleAsync(r => r.RequestId == staleId);
+        Assert.Equal(PendingApprovalRequestStatus.Pending, stillPendingInDb.Status);
+    }
+
     [Fact]
     public async Task ListPendingRequestsAsync_PagingActuallyPages_NoDuplicatesAndNoGaps()
     {
