@@ -40,6 +40,7 @@ public class AuthorizationTests(ApiFixture fixture)
         { "GET", "/v1/mandates/MND-DOESNOTEXIST", null, IdentityScopes.MandateRead },
         { "POST", "/v1/mandates/MND-DOESNOTEXIST/revoke", StatusChangeBody(), IdentityScopes.MandateWrite },
         { "POST", "/v1/authorization/requests", AuthorizationRequestBody(), IdentityScopes.AuthorizationCheck },
+        { "GET", "/v1/authorization/requests", null, IdentityScopes.AuthorizationCheck },
         { "GET", "/v1/authorization/requests/DOES-NOT-EXIST", null, IdentityScopes.AuthorizationCheck },
         { "POST", "/v1/authorization/requests/DOES-NOT-EXIST/approve", ApproveRequestBody(), IdentityScopes.AuthorizationCheck },
         { "GET", "/v1/accounts/ACC-DOESNOTEXIST/approval-policy", null, IdentityScopes.MandateRead },
