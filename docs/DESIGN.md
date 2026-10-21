@@ -1079,10 +1079,14 @@ endpoint, scope, route, or response shape changed.
 **Built:** `UpdateCustomerDetailsRequest(string? FullName, string? Email, string? PhoneNumber)` - a partial
 update of `CustomerIdentityData` only (not `Customer`; `CustomerReference` is out of scope per the task
 file). `UpdateCustomerDetailsRequestValidator` rejects an all-null body (nothing to update) and otherwise
-mirrors `CreateCustomerRequestValidator` field-for-field: `FullName` must be non-blank if supplied, `Email`
-must contain `@` if supplied and non-blank, and `PhoneNumber` has no format check at all - because creation
-does not check it either, and inventing a stricter rule for an update than creation already enforces would
-be exactly the "different standard for the same data" the task file warns against.
+mirrors `CreateCustomerRequestValidator` field-for-field: `Email` must contain `@` if supplied and
+non-blank, and `PhoneNumber` has no format check at all - because creation does not check it either, and
+inventing a stricter rule for an update than creation already enforces would be exactly the "different
+standard for the same data" the task file warns against. **QA fix:** the original version only rejected a
+supplied-but-blank `FullName`, not `Email`/`PhoneNumber` - on a PATCH, `null` ("leave this field alone")
+and `""` (actively supplying a value) are different instructions, so letting two of the three fields
+silently accept `""` and overwrite the stored value with a blank string was a real, asymmetric gap, not a
+stylistic nit. All three fields now reject a supplied-but-blank value the same way.
 `CustomerService.UpdateDetailsAsync` loads the tracked customer (`GetTrackedCustomerOrThrowAsync`, the same
 404-via-`CustomerNotFoundException` path `RecordKycDecisionAsync` already uses), applies only the supplied
 fields, and stages a new `AuditActions.CustomerDetailsUpdated` row - one `"Field old -> new"` entry per
