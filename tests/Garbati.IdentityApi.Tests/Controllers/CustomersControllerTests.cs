@@ -54,6 +54,7 @@ public class CustomersControllerTests
         public int ReactivateCalls { get; private set; }
         public int CloseCalls { get; private set; }
         public int MarkDeceasedCalls { get; private set; }
+        public int UpdateDetailsCalls { get; private set; }
 
         public Task<CustomerResponse> CreateCustomerAsync(CreateCustomerRequest request, CancellationToken cancellationToken = default)
         {
@@ -90,6 +91,12 @@ public class CustomersControllerTests
             MarkDeceasedCalls++;
             return Task.FromResult(customer!);
         }
+
+        public Task<CustomerResponse> UpdateDetailsAsync(string customerId, UpdateCustomerDetailsRequest request, CancellationToken cancellationToken = default)
+        {
+            UpdateDetailsCalls++;
+            return Task.FromResult(customer!);
+        }
     }
 
     private static CustomersController CreateController(StubCustomerService service, StubMandateService? mandateService = null) => new(
@@ -98,7 +105,8 @@ public class CustomersControllerTests
         new CreateCustomerRequestValidator(),
         new KycDecisionRequestValidator(),
         new CustomerStatusChangeRequestValidator(),
-        new AttachMandateRequestValidator());
+        new AttachMandateRequestValidator(),
+        new UpdateCustomerDetailsRequestValidator());
 
     [Fact]
     public async Task CreateCustomer_Returns200_WithTheCreatedCustomer()
@@ -293,6 +301,48 @@ public class CustomersControllerTests
         var errors = Assert.IsAssignableFrom<IReadOnlyList<string>>(badRequest.Value);
         Assert.Contains(errors, e => e.Contains("Reason"));
         Assert.Equal(0, service.MarkDeceasedCalls);
+    }
+
+    [Fact]
+    public async Task UpdateCustomerDetails_Returns200_WithAValidRequest()
+    {
+        var controller = CreateController(new StubCustomerService(Customer));
+
+        var result = await controller.UpdateCustomerDetails(
+            "CUS-ABCDEFGHJKLMNPQ", new UpdateCustomerDetailsRequest("Ada Updated", null, null), CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result.Result);
+        Assert.Equal(Customer, ok.Value);
+    }
+
+    [Fact]
+    public async Task UpdateCustomerDetails_Returns400_AndDoesNotCallTheService_WhenEveryFieldIsNull()
+    {
+        var service = new StubCustomerService(Customer);
+        var controller = CreateController(service);
+
+        var result = await controller.UpdateCustomerDetails(
+            "CUS-ABCDEFGHJKLMNPQ", new UpdateCustomerDetailsRequest(null, null, null), CancellationToken.None);
+
+        var badRequest = Assert.IsType<BadRequestObjectResult>(result.Result);
+        var errors = Assert.IsAssignableFrom<IReadOnlyList<string>>(badRequest.Value);
+        Assert.NotEmpty(errors);
+        Assert.Equal(0, service.UpdateDetailsCalls);
+    }
+
+    [Fact]
+    public async Task UpdateCustomerDetails_Returns400_AndDoesNotCallTheService_WhenFullNameIsBlank()
+    {
+        var service = new StubCustomerService(Customer);
+        var controller = CreateController(service);
+
+        var result = await controller.UpdateCustomerDetails(
+            "CUS-ABCDEFGHJKLMNPQ", new UpdateCustomerDetailsRequest("   ", null, null), CancellationToken.None);
+
+        var badRequest = Assert.IsType<BadRequestObjectResult>(result.Result);
+        var errors = Assert.IsAssignableFrom<IReadOnlyList<string>>(badRequest.Value);
+        Assert.Contains(errors, e => e.Contains("FullName"));
+        Assert.Equal(0, service.UpdateDetailsCalls);
     }
 
     [Fact]

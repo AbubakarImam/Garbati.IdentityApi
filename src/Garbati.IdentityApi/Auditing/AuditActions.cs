@@ -33,4 +33,9 @@ public static class AuditActions
     // T-018 PendingApprovalRequest lifecycle, this is a single synchronous call, same as a single-holder
     // Debit before T-018 existed). ReversalOutcomeRecorded is the one genuinely new lifecycle event.
     public const string ReversalOutcomeRecorded = "ReversalOutcomeRecorded";
+
+    // T-035 addition (DESIGN.md Section 6.3: "Customer creation and privileged identity-data changes"):
+    // PATCH /v1/customers/{customerId}/details, the maker-checker edit OpsApi's T-034 workflow applies
+    // once a CustomerServiceOfficer's staged change is Supervisor-approved.
+    public const string CustomerDetailsUpdated = "CustomerDetailsUpdated";
 }
