@@ -438,6 +438,71 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         Assert.Equal(1, await verifyCtx.OutboxMessages.CountAsync(o => o.MessageType == OutboxMessageTypes.AccountFreezeRequested));
     }
 
+    // T-035 (garbati-platform D-19): PATCH /v1/customers/{customerId}/details.
+    [Fact]
+    public async Task UpdateDetailsAsync_UpdatesOnlyTheSuppliedField_AndLeavesTheOthersUnchanged()
+    {
+        var customerId = await CreateCustomerAsync();
+
+        await using var ctx = fixture.CreateContext();
+        await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .UpdateDetailsAsync(customerId, new UpdateCustomerDetailsRequest("Ada Updated", null, null));
+
+        await using var verifyCtx = fixture.CreateContext();
+        var customer = await verifyCtx.Customers.SingleAsync(c => c.CustomerId == customerId);
+        var identityData = await verifyCtx.CustomerIdentityData.SingleAsync(d => d.CustomerId == customer.Id);
+        Assert.Equal("Ada Updated", identityData.FullName);
+        // Unchanged - the original NewCustomerRequest() values from CreateCustomerAsync's helper above.
+        Assert.Equal("ada@example.com", identityData.Email);
+        Assert.Equal("+2348000000000", identityData.PhoneNumber);
+    }
+
+    [Fact]
+    public async Task UpdateDetailsAsync_UpdatesAllThreeFields_WhenAllThreeAreSupplied()
+    {
+        var customerId = await CreateCustomerAsync();
+
+        await using var ctx = fixture.CreateContext();
+        await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .UpdateDetailsAsync(customerId, new UpdateCustomerDetailsRequest(
+                "Grace Hopper", "grace@example.com", "+2348000000099"));
+
+        await using var verifyCtx = fixture.CreateContext();
+        var customer = await verifyCtx.Customers.SingleAsync(c => c.CustomerId == customerId);
+        var identityData = await verifyCtx.CustomerIdentityData.SingleAsync(d => d.CustomerId == customer.Id);
+        Assert.Equal("Grace Hopper", identityData.FullName);
+        Assert.Equal("grace@example.com", identityData.Email);
+        Assert.Equal("+2348000000099", identityData.PhoneNumber);
+    }
+
+    [Fact]
+    public async Task UpdateDetailsAsync_RecordsAnAuditRow_WithOldAndNewValuesForOnlyTheSuppliedFields()
+    {
+        var customerId = await CreateCustomerAsync();
+
+        await using var ctx = fixture.CreateContext();
+        await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .UpdateDetailsAsync(customerId, new UpdateCustomerDetailsRequest(null, "new-email@example.com", null));
+
+        await using var verifyCtx = fixture.CreateContext();
+        var audit = await verifyCtx.AuditEvents.SingleAsync(a => a.Action == AuditActions.CustomerDetailsUpdated);
+        Assert.Equal(nameof(Customer), audit.EntityType);
+        Assert.Equal(customerId, audit.EntityId);
+        // Only Email was supplied - FullName/PhoneNumber must not appear in the audit details at all.
+        Assert.Contains("Email ada@example.com -> new-email@example.com", audit.Details);
+        Assert.DoesNotContain("FullName", audit.Details);
+        Assert.DoesNotContain("PhoneNumber", audit.Details);
+    }
+
+    [Fact]
+    public async Task UpdateDetailsAsync_Throws_ForAnUnknownCustomer()
+    {
+        await using var ctx = fixture.CreateContext();
+        await Assert.ThrowsAsync<CustomerNotFoundException>(() =>
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+                .UpdateDetailsAsync("CUS-DOESNOTEXIST", new UpdateCustomerDetailsRequest("New Name", null, null)));
+    }
+
     [Theory]
     [InlineData("suspend")]
     [InlineData("reactivate")]
