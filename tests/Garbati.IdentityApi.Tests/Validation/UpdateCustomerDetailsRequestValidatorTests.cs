@@ -49,6 +49,29 @@ public class UpdateCustomerDetailsRequestValidatorTests
         Assert.Contains(errors, e => e.Contains("FullName"));
     }
 
+    // QA review: null ("leave this field alone") and "" ("actively supplying a blank value") are not the
+    // same instruction on a PATCH - a supplied-but-blank Email/PhoneNumber must be rejected the same way
+    // FullName already was, not silently accepted and allowed to overwrite the stored value with "".
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Fails_WhenEmailIsSuppliedButBlank(string email)
+    {
+        var errors = _validator.Validate(new UpdateCustomerDetailsRequest(null, email, null));
+
+        Assert.Contains(errors, e => e.Contains("Email"));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Fails_WhenPhoneNumberIsSuppliedButBlank(string phoneNumber)
+    {
+        var errors = _validator.Validate(new UpdateCustomerDetailsRequest(null, null, phoneNumber));
+
+        Assert.Contains(errors, e => e.Contains("PhoneNumber"));
+    }
+
     [Fact]
     public void Fails_WhenEmailHasNoAtSign()
     {
