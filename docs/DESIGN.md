@@ -380,6 +380,7 @@ Because grants expire after 30 seconds, participating services need synchronized
 | `POST /v1/customers` | Create a customer record. Requires a client-supplied `idempotencyKey`, scoped to the calling client and bound to a hash of the request (decision #29) — mirrors LedgerApi's `POST /api/accounts` (decision #43). |
 | `GET /v1/customers/{customerId}` | Retrieve an appropriately redacted customer view for an authorized caller. |
 | `PATCH /v1/customers/{customerId}/kyc` | Record an authorized KYC status/tier decision. |
+| `PATCH /v1/customers/{customerId}/details` | **(T-035, new)** Partial update of `CustomerIdentityData`'s `FullName`/`Email`/`PhoneNumber` - every field optional, only the supplied ones change. Same `identity.customer.write` scope as `POST /v1/customers`; no new scope. The endpoint `OpsApi`'s T-034 customer-detail-edit maker-checker workflow calls once a staged change is approved. |
 | `POST /v1/customers/{customerId}/suspend` | Suspend a customer through a restricted workflow. |
 | `POST /v1/customers/{customerId}/reactivate` | Reactivate only after required review and checks. |
 | `POST /v1/customers/{customerId}/mandates` | Attach an existing ledger account to the customer with explicit permissions. **(v2: may be called more than once per account, once per holder, for a joint account.)** |
@@ -1064,3 +1065,58 @@ per-test-reset `Postgres` collection `JointApprovalServiceTests` uses), so anoth
   folder - it is a response shape like any other in that folder, just a generic one. If a second list
   endpoint lands on this service (or another Garbati service copies the shape), this is the file to share
   or mirror.
+
+## Appendix G. T-035 build notes (customer-detail-edit endpoint)
+
+This appendix records what `garbati-platform` T-035 actually built: a single, purely additive
+`PATCH /v1/customers/{customerId}/details` action on `CustomersController`, closing the gap found while
+scoping `OpsApi`'s T-034 maker-checker workflow (a `CustomerServiceOfficer` stages a name/email/phone
+change, a `Supervisor` approves it, `OpsApi` then calls this endpoint to apply it) - until now, `IdentityApi`
+had no endpoint that could apply such a change at all. It does not touch `CreateCustomer`,
+`RecordKycDecision`, `Suspend`/`Reactivate`/`Close`/`MarkDeceased`, or the mandate endpoints - no existing
+endpoint, scope, route, or response shape changed.
+
+**Built:** `UpdateCustomerDetailsRequest(string? FullName, string? Email, string? PhoneNumber)` - a partial
+update of `CustomerIdentityData` only (not `Customer`; `CustomerReference` is out of scope per the task
+file). `UpdateCustomerDetailsRequestValidator` rejects an all-null body (nothing to update) and otherwise
+mirrors `CreateCustomerRequestValidator` field-for-field: `FullName` must be non-blank if supplied, `Email`
+must contain `@` if supplied and non-blank, and `PhoneNumber` has no format check at all - because creation
+does not check it either, and inventing a stricter rule for an update than creation already enforces would
+be exactly the "different standard for the same data" the task file warns against.
+`CustomerService.UpdateDetailsAsync` loads the tracked customer (`GetTrackedCustomerOrThrowAsync`, the same
+404-via-`CustomerNotFoundException` path `RecordKycDecisionAsync` already uses), applies only the supplied
+fields, and stages a new `AuditActions.CustomerDetailsUpdated` row - one `"Field old -> new"` entry per
+supplied field, joined with `"; "`, the same `Details` shape `RecordKycDecisionAsync` already uses for
+`KycStatus`/`KycTier` - committed by the same `SaveChangesAsync` call as the entity update. No idempotency
+key: a field-level update has no "retry creates a duplicate" risk (setting the same value twice has no
+different effect than once), the same reasoning `KycDecisionRequest`/`CustomerStatusChangeRequest` already
+rely on. Reuses `IdentityScopes.CustomerWrite` - no new scope.
+
+Tests: `UpdateCustomerDetailsRequestValidatorTests` (all-null fails; one/two/three fields supplied passes;
+blank `FullName` fails; invalid `Email` fails; any non-null `PhoneNumber` passes, mirroring
+`CreateCustomerRequestValidatorTests`'s coverage exactly). `CustomerServiceTests`: updating one field leaves
+the other two unchanged; updating all three together; the audit row's `Details` names only the supplied
+field(s) with correct old/new values; an unknown customer throws `CustomerNotFoundException`.
+`CustomersControllerTests`: 200 for a valid request; 400 (and no service call) for an all-null body and for
+a blank `FullName`. `AuthorizationTests.Endpoints` gained a new theory row for the existing
+401/403/reaches-endpoint scope coverage. New `CustomerDetailsHttpTests` (`[Collection("Api")]`, same shared,
+never-reset Postgres instance as `ReversalAuthorizationHttpTests`/`ListPendingRequestsHttpTests`) checks 404
+for a nonexistent customer and 400 for an all-null body over real HTTP, deliberately asserting nothing about
+response content for the same reason those other files don't.
+
+- **Audit record granularity.** The task file says "old -> new values for whichever fields were actually
+  supplied," which this reads as "supplied" rather than "actually different from the current value" - a
+  caller that re-sends the same `FullName` still gets a `FullName X -> X` audit line, exactly like
+  `SuspendCustomerAsync` does *not* audit a no-op repeat (idempotent status transitions are a different,
+  deliberately no-op-aware pattern) but `RecordKycDecisionAsync` always audits whatever decision it was
+  given, regardless of whether it changed anything. This endpoint follows the latter precedent: it is a
+  plain field-level write, not a state-machine transition, so there is no "idempotent repeat" case to
+  special-case the way suspend/reactivate do.
+- **`Customer.UpdatedAt` left untouched.** Only `CustomerIdentityData.UpdatedAt` is bumped - no field on
+  `Customer` itself changes here (unlike `RecordKycDecisionAsync`, which touches `Customer.KycStatus`/
+  `KycTier` directly). Bumping `Customer.UpdatedAt` for a change that happened entirely on a different,
+  deliberately separated table (Section 2.1/7.1's identity-data split) would make `GET`'s `updatedAt` claim
+  a change to fields it does not even expose (`CustomerResponse`'s redacted view, Section 6.2) - `CustomerResponse`
+  already doesn't expose `FullName`/`Email`/`PhoneNumber`, so tracking their last-changed time on the
+  `CustomerIdentityData` row they actually live on is strictly more correct than mixing sentinel semantics
+  into `Customer.UpdatedAt` here.
