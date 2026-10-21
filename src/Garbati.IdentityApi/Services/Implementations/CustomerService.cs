@@ -183,6 +183,54 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
         return ToResponse(customer);
     }
 
+    // T-035 (garbati-platform D-19): a partial update of CustomerIdentityData - only the fields the
+    // caller actually supplied (non-null) change. No status check (unlike RecordKycDecisionAsync): the
+    // task file scopes this to the three plain contact/identity fields only, with no interaction with
+    // CustomerStatus/KycStatus/KycTier at all, so a Suspended customer's details can still be corrected
+    // (e.g. a typo found during the very review that suspended them).
+    public async Task<CustomerResponse> UpdateDetailsAsync(
+        string customerId, UpdateCustomerDetailsRequest request, CancellationToken cancellationToken = default)
+    {
+        var customer = await GetTrackedCustomerOrThrowAsync(customerId, cancellationToken);
+        var identityData = customer.IdentityData!; // every customer has one, created alongside it in CreateCustomerAsync
+
+        // One "field old -> new" entry per supplied field, same shape as RecordKycDecisionAsync's
+        // Details string, so the audit row says exactly what changed without needing a second query.
+        var changes = new List<string>();
+
+        if (request.FullName is not null)
+        {
+            changes.Add($"FullName {identityData.FullName} -> {request.FullName}");
+            identityData.FullName = request.FullName;
+        }
+
+        if (request.Email is not null)
+        {
+            changes.Add($"Email {identityData.Email ?? "(none)"} -> {request.Email}");
+            identityData.Email = request.Email;
+        }
+
+        if (request.PhoneNumber is not null)
+        {
+            changes.Add($"PhoneNumber {identityData.PhoneNumber ?? "(none)"} -> {request.PhoneNumber}");
+            identityData.PhoneNumber = request.PhoneNumber;
+        }
+
+        identityData.UpdatedAt = DateTimeOffset.UtcNow;
+
+        auditLogger.Record(new AuditEvent
+        {
+            Action = AuditActions.CustomerDetailsUpdated,
+            EntityType = nameof(Customer),
+            EntityId = customer.CustomerId,
+            Status = customer.CustomerStatus.ToString(),
+            Details = string.Join("; ", changes),
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return ToResponse(customer);
+    }
+
     // Active -> Suspended. Already-Suspended is treated as idempotent (returns the current state, 200);
     // Closed/Deceased is terminal and refuses with 409 (DESIGN.md Section 2.1: "No - terminal").
     public Task<CustomerResponse> SuspendCustomerAsync(

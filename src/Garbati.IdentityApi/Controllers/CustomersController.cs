@@ -18,7 +18,8 @@ public class CustomersController(
     CreateCustomerRequestValidator createCustomerRequestValidator,
     KycDecisionRequestValidator kycDecisionRequestValidator,
     CustomerStatusChangeRequestValidator customerStatusChangeRequestValidator,
-    AttachMandateRequestValidator attachMandateRequestValidator) : ControllerBase
+    AttachMandateRequestValidator attachMandateRequestValidator,
+    UpdateCustomerDetailsRequestValidator updateCustomerDetailsRequestValidator) : ControllerBase
 {
     [Authorize(Policy = IdentityScopes.CustomerWrite)]
     [HttpPost]
@@ -93,6 +94,29 @@ public class CustomersController(
         }
 
         var customer = await customerService.ReactivateCustomerAsync(customerId, request, cancellationToken);
+        return Ok(customer);
+    }
+
+    // T-035 (garbati-platform D-19): a partial update of FullName/Email/PhoneNumber (CustomerIdentityData
+    // only - CustomerReference, CustomerStatus, KycStatus/KycTier are all out of scope, see the task
+    // file). Same scope POST /v1/customers already uses - no new scope. 404 for an unknown customer comes
+    // from GetTrackedCustomerOrThrowAsync throwing CustomerNotFoundException, caught by
+    // ExceptionHandlingMiddleware - the same mechanism RecordKycDecision/SuspendCustomer/etc. already use,
+    // not a null check here.
+    [Authorize(Policy = IdentityScopes.CustomerWrite)]
+    [HttpPatch("{customerId}/details")]
+    public async Task<ActionResult<CustomerResponse>> UpdateCustomerDetails(
+        string customerId,
+        [FromBody] UpdateCustomerDetailsRequest request,
+        CancellationToken cancellationToken)
+    {
+        var errors = updateCustomerDetailsRequestValidator.Validate(request);
+        if (errors.Count > 0)
+        {
+            return BadRequest(errors);
+        }
+
+        var customer = await customerService.UpdateDetailsAsync(customerId, request, cancellationToken);
         return Ok(customer);
     }
 
