@@ -177,6 +177,8 @@ openssl ec -in private.pem -pubout -out public.pem                     # for who
 
 Every request gets a correlation id (`X-Correlation-ID`), the same pattern as LedgerApi. Audit rows (`audit_events`) are written in the same database transaction as the change they describe. Nothing logs a raw BVN/NIN - this build does not even store one yet (see `Entities/CustomerIdentityData.cs`). The signed grant token is never logged or persisted anywhere - only its decision id (`jti`).
 
+This is deliberately all GARBATI ships today - no metrics/tracing/alerting stack. See `garbati-platform`'s `OBSERVABILITY.md` for why, and what to reach for if you need more.
+
 ## Deployment
 
 The `Dockerfile` builds two images:
