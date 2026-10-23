@@ -4,13 +4,16 @@ namespace Garbati.IdentityApi.Entities;
 // fields, so they can carry stricter access control and, eventually, encryption-at-rest and a retention
 // policy of their own.
 //
-// Deliberately minimal for T-016 (not a full KYC-data-model build - see the task file): a name and basic
-// contact details only. No BVN/NIN column here. DESIGN.md Section 6.2 forbids logging a raw BVN/NIN, and
-// the same care has to apply to how one is *stored*, not just logged - e.g. encryption-at-rest via
-// whatever standard mechanism the hosting Postgres offers, or column-level encryption. Neither has been
-// decided yet, so rather than guess at cryptography this column is left out entirely. Flagged in the PR
-// as a follow-up for whoever first needs to store a real BVN/NIN (likely T-017's KYC evidence work or a
-// later task), not for this one to invent.
+// T-016 deliberately left Bvn/Nin out, pending a cryptography decision (see the original comment,
+// preserved in git history). T-044 (garbati-platform D-26, 23 Oct 2026) made that decision - "store
+// unencrypted for now, revisit encryption later" - after research found no specific NDPA/CBN mandate
+// requiring encryption, only a general risk-based duty. Bvn/Nin below are therefore plain, unencrypted
+// nullable strings, set once each via PATCH /v1/customers/{customerId}/identity-numbers
+// (SubmitIdentityNumbersAsync) - never through this endpoint's sibling, UpdateDetailsAsync, which has
+// ordinary "overwrite freely" semantics that are deliberately wrong for an identity number. Logging rules
+// (ARCHITECTURE.md Section 5, DESIGN.md Section 6.2: "never log a raw BVN/NIN") apply to these two
+// columns' values with no exception - including in AuditEvent.Details, which is not a Serilog log line
+// but is just as durable and just as readable.
 public class CustomerIdentityData
 {
     public long Id { get; set; }
@@ -18,6 +21,8 @@ public class CustomerIdentityData
     public string FullName { get; set; } = null!;
     public string? Email { get; set; }
     public string? PhoneNumber { get; set; }
+    public string? Bvn { get; set; }
+    public string? Nin { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 
