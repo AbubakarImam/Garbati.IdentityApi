@@ -85,7 +85,7 @@ Fields:
 - `JurisdictionCode`
 - `CreatedAt`, `UpdatedAt`
 
-Sensitive identity fields are separated from ordinary operational fields (`CustomerIdentityData`, 7.1), protected by encryption, least-privilege access and an explicit retention policy.
+Sensitive identity fields are separated from ordinary operational fields (`CustomerIdentityData`, 7.1), protected by least-privilege access and an explicit retention policy. **Bvn/Nin specifically (T-044, decision #26, `garbati-platform` D-26) are stored unencrypted for now** - not a blanket statement that every field on this table is unencrypted by design, but the actual, deliberate posture for these two fields after research found no specific NDPA/CBN mandate requiring encryption, only a general risk-based duty (`garbati-platform/research/ndpa-encryption-requirement.md`). Revisiting encryption later remains open.
 
 A customer **may exist with zero mandates**. Registration does not by itself grant permission to operate a ledger account. An unverified or otherwise ineligible customer must not receive an authorization grant for an operation that requires a higher KYC status/tier.
 
@@ -381,6 +381,7 @@ Because grants expire after 30 seconds, participating services need synchronized
 | `GET /v1/customers/{customerId}` | Retrieve an appropriately redacted customer view for an authorized caller. |
 | `PATCH /v1/customers/{customerId}/kyc` | Record an authorized KYC status/tier decision. |
 | `PATCH /v1/customers/{customerId}/details` | **(T-035, new)** Partial update of `CustomerIdentityData`'s `FullName`/`Email`/`PhoneNumber` - every field optional, only the supplied ones change. Same `identity.customer.write` scope as `POST /v1/customers`; no new scope. The endpoint `OpsApi`'s T-034 customer-detail-edit maker-checker workflow calls once a staged change is approved. |
+| `PATCH /v1/customers/{customerId}/identity-numbers` | **(T-044, new)** Set-once submission of `CustomerIdentityData.Bvn`/`.Nin` - at least one of the two required per request; a field already set rejects a *different* resubmitted value with 409, and accepts the *same* one idempotently. Deliberately its own endpoint, not folded into `.../details` above - identity numbers are not freely editable the way a name/email/phone is. Scope `identity.kyc.manage`, not `identity.customer.write`: this is part of the KYC evidence pipeline (see Appendix H), not general contact-detail editing. |
 | `POST /v1/customers/{customerId}/suspend` | Suspend a customer through a restricted workflow. |
 | `POST /v1/customers/{customerId}/reactivate` | Reactivate only after required review and checks. |
 | `POST /v1/customers/{customerId}/mandates` | Attach an existing ledger account to the customer with explicit permissions. **(v2: may be called more than once per account, once per holder, for a joint account.)** |
@@ -445,6 +446,7 @@ Keep durable audit events separate from diagnostic application logs (decision #1
 - Privileged overrides, including actor and reason.
 - Authorization decisions, with the grant/decision ID and outcome.
 - Freeze propagation attempts and acknowledgements (2.5's outbox).
+- **(T-044)** Identity-number submission (`IdentityNumberSubmitted`) - which of `Bvn`/`Nin` changed, never the submitted value itself; a set-once no-op (resubmitting the already-stored value) writes no row (Appendix H).
 
 Audit events are append-only from ordinary application code, access-restricted and retained according to approved policy. Correlation IDs connect diagnostics, authorization decisions and ledger outcomes without replacing the unique decision/grant ID.
 
@@ -457,7 +459,7 @@ Audit events are append-only from ordinary application code, access-restricted a
 | Table | Responsibility |
 |---|---|
 | `Customers` | Internal customer identity, current operational status, KYC state/tier and timestamps. |
-| `CustomerIdentityData` | Sensitive identity/contact fields, with stricter access and encryption. |
+| `CustomerIdentityData` | Sensitive identity/contact fields, with stricter access. Includes `Bvn`/`Nin` (T-044) - stored unencrypted for now (decision #26), not encrypted like the table's own earlier, now-outdated general description claimed. |
 | `KycVerifications` | Append-only verification attempts/results and provider references. |
 | `KycTierPolicies` | Configurable jurisdiction/tier rules with effective dates. |
 | `Mandates` | Customer-to-ledger-account relationship, state, creation and revocation details. Unique partial index on `(CustomerId, LedgerAccountId) WHERE Status = 'Active'` — **not** a unique index on `LedgerAccountId` alone, which would make joint accounts impossible. |
@@ -683,10 +685,12 @@ T-017): `Mandates`, `MandatePermissions`, the joint-account entities, `/v1/manda
   has since confirmed it belongs here (OrchestratorApi's own design already assumed the guarantee exists);
   `idempotencyKey` is now required, with the same client-scoped-key-plus-request-hash mechanics as
   LedgerApi's `POST /api/accounts` (decision #43). See decision #29.
-- **`#TBD-4` (`CustomerIdentityData` fields).** Kept to `FullName`/`Email`/`PhoneNumber` only — no BVN/NIN
-  column. Section 6.2's "never log raw BVN/NIN" rule implies the same care is needed for *storage*
-  (encryption at rest), which has not been decided yet; rather than guess at cryptography, that column is
-  left out entirely pending a follow-up decision (likely needed by T-017's KYC evidence work).
+- **`#TBD-4` (`CustomerIdentityData` fields) — resolved by T-044 (decision #26, `garbati-platform` D-26,
+  23 Oct 2026).** Kept to `FullName`/`Email`/`PhoneNumber` only — no BVN/NIN column. Section 6.2's "never
+  log raw BVN/NIN" rule implies the same care is needed for *storage* (encryption at rest), which has not
+  been decided yet; rather than guess at cryptography, that column is left out entirely pending a
+  follow-up decision (likely needed by T-017's KYC evidence work). **Resolution:** store unencrypted for
+  now, revisit encryption later — see Appendix H for the `Bvn`/`Nin` columns this unblocked.
 - **`#TBD-5` (Closed/Deceased cascade, decision #14 — the known gap).** T-016 builds the status
   transition, its audit event, and the target *shape* of the freeze outbox message
   (`Contracts.Outbox.AccountFreezeRequestedPayload`), but **not** the mandate lookup itself — `Mandates`
@@ -1124,3 +1128,95 @@ response content for the same reason those other files don't.
   already doesn't expose `FullName`/`Email`/`PhoneNumber`, so tracking their last-changed time on the
   `CustomerIdentityData` row they actually live on is strictly more correct than mixing sentinel semantics
   into `Customer.UpdatedAt` here.
+
+---
+
+## Appendix H. T-044 build notes (BVN/NIN storage, narrow KYC-tier evidence enforcement)
+
+This appendix records what `garbati-platform` T-044 actually built: the `Bvn`/`Nin` columns `#TBD-4`
+(Appendix B) left out pending decision #26, a new set-once endpoint to submit them, and a real but
+deliberately narrow slice of `KycTierPolicy.RequiredEvidence` enforcement in `RecordKycDecisionAsync` -
+confirmed, before this task, that `RequiredEvidence` was stored but read nowhere in the codebase at all,
+so any caller could grant any tier to any customer regardless of what evidence actually existed. This
+task closes the BVN/NIN-cardinality half of that gap specifically.
+
+**Built:**
+
+- `CustomerIdentityData.Bvn`/`.Nin` - nullable `string`, unencrypted (decision #26). Additive migration;
+  every existing row gets `NULL` for both, no default invented. Format: exactly 11 ASCII digits
+  (`IdentityNumberRule`), checked only when a value is actually supplied.
+- `PATCH /v1/customers/{customerId}/identity-numbers` (`SubmitIdentityNumbersRequest(Bvn, Nin)`), scope
+  `identity.kyc.manage` (not `identity.customer.write` - this is KYC evidence, not contact-detail
+  editing). Set-once per field: `null` stored + a supplied value sets it; the *same* value resubmitted is
+  an idempotent no-op (200, no second audit row - a real change is what the audit trail should describe,
+  not a restated fact); a *different* value against an already-set field is a 409, with no admin-override
+  path in this task. `AuditActions.IdentityNumberSubmitted`'s `Details` names only which field(s) changed
+  ("Bvn set"/"Nin set") - the submitted value itself is exactly the kind of thing Section 6.2 forbids
+  logging, and that discipline applies to this durable `AuditEvent.Details` text too, not only to Serilog
+  request logs. Response stays the unchanged `CustomerResponse` - no `Bvn`/`Nin` property added anywhere.
+  **QA fix (PR #7 review):** the set-once check was originally pure application-level read-then-write
+  with no database-level guard - two concurrent requests for the same customer with *different* values
+  could each read `Bvn`/`Nin` as `null`, each pass the "not yet set" branch, and each successfully save,
+  the second silently overwriting the first with no 409 to either caller. Fixed with a
+  `SELECT ... FOR UPDATE` row lock on the customer's `customer_identity_data` row for the method's
+  duration (same pattern `JointApprovalService.ApproveAsync` already uses for an analogous race) - a real
+  database-enforced guard, not an application-level check alone. A plain unique constraint (the mandate-
+  uniqueness pattern, Section 7.4/decision #19) does not apply here: there is no cross-row uniqueness
+  invariant, only a single row's null-to-value transition that two transactions must not race. Proven by
+  a genuine concurrency test (`SubmitIdentityNumbersAsync_TwoConcurrentRequestsWithDifferentBvnValues_OnlyOneWins`),
+  not two sequential awaited calls.
+- `KycEvidenceTokens.AtLeastOneIdentityNumber`/`.BothIdentityNumbers` - two new entries in the existing,
+  already-configurable `RequiredEvidence` jsonb vocabulary (decision #11), not a new hardcoded rule
+  bypassing it. A new migration (not an edit to the old `SeedPlaceholderKycTierPolicies` migration) adds
+  `AtLeastOneIdentityNumber` to the seeded `Tier1`/`Tier2` placeholder rows and `BothIdentityNumbers` to
+  `Tier3`, matching `garbati-platform/research/nigerian-regulatory-requirements.md` Q1's real cardinality
+  (Tier1/Tier2 need at least one of BVN/NIN; Tier3 needs both) - the rows are still placeholder data
+  overall (the `SelfDeclaredIdentity`/`GovernmentId`/`SourceOfFunds` tokens are untouched and still
+  unenforced), only this one cardinality fact is asserted as independently confirmed.
+- `RecordKycDecisionAsync`, immediately before `customer.KycTier = request.KycTier` (so still only reached
+  when `newStatus == KycStatus.Verified`): looks up the currently-effective `KycTierPolicy` for
+  `(customer.JurisdictionCode, request.KycTier)` and checks **only** whether
+  `AtLeastOneIdentityNumber`/`BothIdentityNumbers` (whichever that policy's `RequiredEvidence` names) is
+  satisfied by `CustomerIdentityData.Bvn`/`.Nin`. On failure: 422 (`KycTierEvidenceNotMetException`), and
+  the whole decision fails atomically - no `KycVerification` row, no `KycStatus`/`KycTier` change - the
+  same "whole operation fails together" shape already used elsewhere (e.g. `AccountOpeningService`'s step
+  failures, or a failed chain reversal in LedgerApi). No matching policy row at all is treated as nothing
+  to check (the same behavior as before this task existed, not a new failure mode). A non-`Verified`
+  decision never reaches this check at all, matching the pre-existing `if (newStatus == KycStatus.Verified)`
+  guard exactly.
+
+**Deliberately not built (scope boundary, not an oversight):**
+
+- **`SelfDeclaredIdentity`/`GovernmentId`/`SourceOfFunds` enforcement.** Confirmed, unchanged, pre-existing
+  gap - no backing data exists anywhere in the system for any of the three (no column, no document-storage
+  mechanism), so enforcing them now would make Tier2/Tier3 permanently ungrantable until a much bigger,
+  separate piece of work (document evidence storage) is built. This task closes the BVN/NIN-cardinality
+  slice of `RequiredEvidence` specifically, not the full vocabulary.
+- **Real external BVN/NIN verification** (NIBSS or any third-party KYC provider confirming the number is
+  authentic). This task only stores a self-/ops-submitted value and checks its *presence*, never its
+  *authenticity*.
+- **Encryption at rest, and retention/purge.** Encryption: decided, unencrypted for now (decision #26).
+  Retention: still open (`garbati-platform/research/nigerian-regulatory-requirements.md` Q2/Q3, 5 vs. 6
+  years unresolved) - no purge job, no deletion logic; storing indefinitely for now is the unchanged status
+  quo for every other field on this table too.
+- **Any change to `UpdateCustomerDetailsRequest`/`UpdateDetailsAsync`.** BVN/NIN get their own endpoint
+  with different (set-once) semantics; T-035's endpoint is untouched.
+
+**Tests:** migration applies cleanly, existing rows get `NULL` for both new columns (`MigrationTests`,
+including a raw-SQL-inserted row that never mentions the new columns, proving no default was invented);
+format validation for too-short/too-long/non-digit/non-ASCII-digit values
+(`SubmitIdentityNumbersRequestValidatorTests`); set-once behavior including a direct database query
+proving a rejected 409 attempt left the stored value unchanged, not just that the response code was right
+(`CustomerServiceTests`); a genuine concurrency repro where two different Bvn values race for the same
+customer via `Task.Run`/`Task.WhenAll` against two independent `DbContext`s, proving exactly one wins and
+the stored value is the winner's, not a mix (`SubmitIdentityNumbersAsync_TwoConcurrentRequestsWithDifferentBvnValues_OnlyOneWins`,
+added in the PR #7 QA follow-up above); tier-cardinality enforcement for Tier1/Tier2 (at least one) and Tier3 (both),
+including that a non-`Verified` decision never triggers the check regardless of what evidence is on file;
+a direct query against the actual `AuditEvent` row proving `Details` never contains the literal submitted
+value; and a real HTTP round trip (`IdentityNumbersHttpTests`) parsing a live response's JSON to prove it
+carries no `bvn`/`nin` key, not relying on `CustomerResponse` having no such property as the only proof.
+`AuthorizationTests.Endpoints` gained a new theory row for the existing 401/403/reaches-endpoint scope
+coverage. Four pre-existing test files (`AuthorizationServiceTests`, `JointApprovalServiceTests`,
+`ReversalAuthorizationServiceTests`, and one test in `CustomerServiceTests` itself) that grant a KYC tier
+purely as unrelated test setup were updated to submit a throwaway identity number first - a real,
+necessary consequence of this task's new enforcement actually working, not a weakened or deleted test.

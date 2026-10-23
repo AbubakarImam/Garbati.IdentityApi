@@ -102,6 +102,7 @@ try
     builder.Services.AddScoped<CustomerStatusChangeRequestValidator>();
     builder.Services.AddScoped<AttachMandateRequestValidator>();
     builder.Services.AddScoped<UpdateCustomerDetailsRequestValidator>();
+    builder.Services.AddScoped<SubmitIdentityNumbersRequestValidator>();
     builder.Services.AddScoped<RevokeMandateRequestValidator>();
     builder.Services.AddScoped<AuthorizationRequestValidator>();
     builder.Services.AddScoped<ApproveRequestValidator>();

@@ -40,6 +40,11 @@ public class AuthorizationServiceTests(PostgresFixture fixture) : IAsyncLifetime
 
         if (kycTier is not null)
         {
+            // T-044 (garbati-platform D-26): granting Tier1/Tier2 now requires at least one of Bvn/Nin on
+            // file - this helper is not testing that enforcement itself (CustomerServiceTests.cs covers
+            // it directly), so it satisfies it unconditionally here with a throwaway value.
+            await customerService.SubmitIdentityNumbersAsync(
+                response.CustomerId, new SubmitIdentityNumbersRequest("12345678901", null));
             await customerService.RecordKycDecisionAsync(
                 response.CustomerId,
                 new KycDecisionRequest("Verified", kycTier, "BVN", "test-provider", null, "OK", null));

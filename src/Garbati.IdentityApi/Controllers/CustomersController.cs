@@ -19,7 +19,8 @@ public class CustomersController(
     KycDecisionRequestValidator kycDecisionRequestValidator,
     CustomerStatusChangeRequestValidator customerStatusChangeRequestValidator,
     AttachMandateRequestValidator attachMandateRequestValidator,
-    UpdateCustomerDetailsRequestValidator updateCustomerDetailsRequestValidator) : ControllerBase
+    UpdateCustomerDetailsRequestValidator updateCustomerDetailsRequestValidator,
+    SubmitIdentityNumbersRequestValidator submitIdentityNumbersRequestValidator) : ControllerBase
 {
     [Authorize(Policy = IdentityScopes.CustomerWrite)]
     [HttpPost]
@@ -117,6 +118,32 @@ public class CustomersController(
         }
 
         var customer = await customerService.UpdateDetailsAsync(customerId, request, cancellationToken);
+        return Ok(customer);
+    }
+
+    // T-044 (garbati-platform D-26): set-once submission of Bvn/Nin - deliberately its own endpoint with
+    // its own scope choice. Uses KycManage, not CustomerWrite: this is part of the KYC evidence pipeline
+    // (RecordKycDecisionAsync's tier-cardinality check reads exactly what this endpoint writes), not
+    // general contact-detail editing - see the task file for why UpdateCustomerDetails (above) is
+    // deliberately not reused for this. 409 (already set, different value) and 422 responses come from
+    // CustomerService.SubmitIdentityNumbersAsync throwing IdentityNumberAlreadySetException, caught by
+    // ExceptionHandlingMiddleware - the same mechanism every other status-code-via-exception path here
+    // already uses. Response is the unchanged CustomerResponse (never Bvn/Nin - see that record's own
+    // comment); this endpoint adds no new fields to it.
+    [Authorize(Policy = IdentityScopes.KycManage)]
+    [HttpPatch("{customerId}/identity-numbers")]
+    public async Task<ActionResult<CustomerResponse>> SubmitIdentityNumbers(
+        string customerId,
+        [FromBody] SubmitIdentityNumbersRequest request,
+        CancellationToken cancellationToken)
+    {
+        var errors = submitIdentityNumbersRequestValidator.Validate(request);
+        if (errors.Count > 0)
+        {
+            return BadRequest(errors);
+        }
+
+        var customer = await customerService.SubmitIdentityNumbersAsync(customerId, request, cancellationToken);
         return Ok(customer);
     }
 

@@ -15,6 +15,7 @@ public class AuthorizationTests(ApiFixture fixture)
     private static string KycDecisionBody() => """{"kycStatus":"Pending","verificationType":"BVN","provider":"test-provider"}""";
     private static string StatusChangeBody() => """{"reason":"auth test"}""";
     private static string UpdateDetailsBody() => """{"fullName":"Auth Test Updated"}""";
+    private static string SubmitIdentityNumbersBody() => """{"bvn":"12345678901"}""";
     private static string AttachMandateBody() => """{"ledgerAccountId":"ACC-AUTHZ-TEST","operations":["View"]}""";
     private static string AuthorizationRequestBody() => """
         {"requestedBy":"CUS-DOESNOTEXIST","operation":"Debit","debitAccountId":"ACC-1","creditAccountId":"ACC-2",
@@ -36,6 +37,7 @@ public class AuthorizationTests(ApiFixture fixture)
         { "POST", "/v1/customers/CUS-DOESNOTEXIST/close", StatusChangeBody(), IdentityScopes.CustomerWrite },
         { "POST", "/v1/customers/CUS-DOESNOTEXIST/mark-deceased", StatusChangeBody(), IdentityScopes.CustomerWrite },
         { "PATCH", "/v1/customers/CUS-DOESNOTEXIST/details", UpdateDetailsBody(), IdentityScopes.CustomerWrite },
+        { "PATCH", "/v1/customers/CUS-DOESNOTEXIST/identity-numbers", SubmitIdentityNumbersBody(), IdentityScopes.KycManage },
         { "POST", "/v1/customers/CUS-DOESNOTEXIST/mandates", AttachMandateBody(), IdentityScopes.MandateWrite },
         { "GET", "/v1/customers/CUS-DOESNOTEXIST/mandates", null, IdentityScopes.MandateRead },
         { "GET", "/v1/accounts/ACC-DOESNOTEXIST/mandates", null, IdentityScopes.MandateRead },
