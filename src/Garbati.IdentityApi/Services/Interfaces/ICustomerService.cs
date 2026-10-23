@@ -20,4 +20,6 @@ public interface ICustomerService
     Task<CustomerResponse> MarkDeceasedAsync(string customerId, CustomerStatusChangeRequest request, CancellationToken cancellationToken = default);
 
     Task<CustomerResponse> UpdateDetailsAsync(string customerId, UpdateCustomerDetailsRequest request, CancellationToken cancellationToken = default);
+
+    Task<CustomerResponse> SubmitIdentityNumbersAsync(string customerId, SubmitIdentityNumbersRequest request, CancellationToken cancellationToken = default);
 }
