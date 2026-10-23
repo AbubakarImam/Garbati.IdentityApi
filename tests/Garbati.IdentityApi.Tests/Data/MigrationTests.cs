@@ -22,6 +22,8 @@ public class MigrationTests(PostgresFixture fixture)
         Assert.Contains(applied, m => m.EndsWith("AddMandatesAndAuthorization"));
         Assert.Contains(applied, m => m.EndsWith("AddJointApprovalWorkflow"));
         Assert.Contains(applied, m => m.EndsWith("AddReversalAuthorization"));
+        Assert.Contains(applied, m => m.EndsWith("AddBvnNinToCustomerIdentityData"));
+        Assert.Contains(applied, m => m.EndsWith("AddBvnNinCardinalityToKycTierPolicies"));
     }
 
     [Fact]
@@ -35,7 +37,7 @@ public class MigrationTests(PostgresFixture fixture)
             "idempotency_key", "initiated_by", "request_hash");
 
         await AssertColumnsAsync(ctx, "customer_identity_data",
-            "id", "customer_id", "full_name", "email", "phone_number", "created_at", "updated_at");
+            "id", "customer_id", "full_name", "email", "phone_number", "bvn", "nin", "created_at", "updated_at");
 
         await AssertColumnsAsync(ctx, "kyc_verifications",
             "id", "customer_id", "verification_type", "provider", "provider_reference",
@@ -91,6 +93,60 @@ public class MigrationTests(PostgresFixture fixture)
 
         Assert.Equal(["Tier1", "Tier2", "Tier3"], tiers.Select(t => t.TierCode));
         Assert.All(tiers, t => Assert.NotEmpty(t.RequiredEvidence));
+    }
+
+    // T-044 (garbati-platform D-26): AddBvnNinCardinalityToKycTierPolicies updates the same three
+    // placeholder rows above to add the real BVN/NIN cardinality from research/
+    // nigerian-regulatory-requirements.md Q1 - Tier1/Tier2 need at least one of Bvn/Nin, Tier3 needs
+    // both - without dropping any of the pre-existing SelfDeclaredIdentity/GovernmentId/SourceOfFunds
+    // tokens the original seed migration inserted.
+    [Fact]
+    public async Task CardinalityMigration_AddsBvnNinEvidenceTokens_WithoutRemovingExistingOnes()
+    {
+        await using var ctx = fixture.CreateContext();
+
+        var tiers = await ctx.KycTierPolicies.AsNoTracking()
+            .Where(p => p.JurisdictionCode == "NG")
+            .ToDictionaryAsync(p => p.TierCode);
+
+        Assert.Contains("SelfDeclaredIdentity", tiers["Tier1"].RequiredEvidence);
+        Assert.Contains("AtLeastOneIdentityNumber", tiers["Tier1"].RequiredEvidence);
+
+        Assert.Contains("GovernmentId", tiers["Tier2"].RequiredEvidence);
+        Assert.Contains("AtLeastOneIdentityNumber", tiers["Tier2"].RequiredEvidence);
+
+        Assert.Contains("SourceOfFunds", tiers["Tier3"].RequiredEvidence);
+        Assert.Contains("BothIdentityNumbers", tiers["Tier3"].RequiredEvidence);
+        // Tier3 needs BOTH, not "at least one" - the two tokens are not interchangeable.
+        Assert.DoesNotContain("AtLeastOneIdentityNumber", tiers["Tier3"].RequiredEvidence);
+    }
+
+    // T-044: the AddBvnNinToCustomerIdentityData migration is additive only - no default value invented,
+    // no data loss for any row that predates it. Modelled here as a row inserted via raw SQL without
+    // mentioning the new columns at all (exactly what every row looked like before this migration
+    // existed) - the real proof is that this still works post-migration and leaves both columns NULL,
+    // not some other default.
+    [Fact]
+    public async Task AddBvnNinColumns_ExistingRowsGetNull_ForBothNewColumns_NoDefaultInvented()
+    {
+        await using var ctx = fixture.CreateContext();
+
+        await ctx.Database.ExecuteSqlRawAsync("""
+            INSERT INTO customers
+                (customer_id, customer_status, kyc_status, jurisdiction_code, created_at, updated_at, idempotency_key, request_hash)
+            VALUES
+                ('CUS-PREMIGRATION', 'Active', 'Pending', 'NG', now(), now(), 'pre-migration-test-key', 'test-hash')
+            """);
+        await ctx.Database.ExecuteSqlRawAsync("""
+            INSERT INTO customer_identity_data (customer_id, full_name, created_at, updated_at)
+            SELECT id, 'Pre-Migration Customer', now(), now() FROM customers WHERE customer_id = 'CUS-PREMIGRATION'
+            """);
+
+        var identityData = await ctx.CustomerIdentityData.AsNoTracking()
+            .SingleAsync(d => d.Customer.CustomerId == "CUS-PREMIGRATION");
+
+        Assert.Null(identityData.Bvn);
+        Assert.Null(identityData.Nin);
     }
 
     private static async Task AssertColumnsAsync(Microsoft.EntityFrameworkCore.DbContext ctx, string table, params string[] expectedColumns)
