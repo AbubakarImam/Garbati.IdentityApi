@@ -240,8 +240,35 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
     public async Task<CustomerResponse> SubmitIdentityNumbersAsync(
         string customerId, SubmitIdentityNumbersRequest request, CancellationToken cancellationToken = default)
     {
-        var customer = await GetTrackedCustomerOrThrowAsync(customerId, cancellationToken);
-        var identityData = customer.IdentityData!; // every customer has one, created alongside it in CreateCustomerAsync
+        // QA-flagged concurrency fix (PR #7 review): without a row lock, two concurrent PATCH requests
+        // for the SAME customer with DIFFERENT values could each read Bvn/Nin as null, each pass the
+        // "not yet set" branch, and each successfully SaveChangesAsync - the second silently overwrites
+        // the first with no 409 to either caller, exactly the fraud scenario this endpoint exists to
+        // close. SELECT ... FOR UPDATE locks this customer's identity-data row for the rest of this
+        // method, so a concurrent call for the same customer blocks until this one commits (or rolls
+        // back) and then sees the now-set value - a real database-enforced guard (Postgres blocking the
+        // second transaction), not an application-level check alone. Same category of problem, same
+        // fix shape, as JointApprovalService.ApproveAsync's own FOR UPDATE lock (that one on
+        // pending_approval_requests; this one on customer_identity_data) - and the same reason a plain
+        // unique constraint (DESIGN.md 7.4/decision #19's pattern for mandate uniqueness) doesn't apply
+        // here: there is no cross-row uniqueness invariant to enforce, only a single row's null-to-value
+        // transition that two transactions must not race.
+        //
+        // The customer itself is read AsNoTracking and never locked or mutated here (T-044 doesn't touch
+        // Customer.UpdatedAt - see UpdateDetailsAsync's own precedent below) - only the identity-data row
+        // needs the lock. FromSqlInterpolated, not Include() off a locked Customer query, for the same
+        // reason JointApprovalService avoids FOR UPDATE through an outer join: Customer.IdentityData is
+        // nullable at the schema level (the FK lives on CustomerIdentityData), so Include() would compose
+        // a LEFT JOIN, and Postgres refuses FOR UPDATE on the nullable side of one.
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+
+        var customer = await dbContext.Customers.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.CustomerId == customerId, cancellationToken)
+            ?? throw new CustomerNotFoundException($"Customer '{customerId}' was not found.");
+
+        var identityData = await dbContext.CustomerIdentityData
+            .FromSqlInterpolated($"SELECT * FROM customer_identity_data WHERE customer_id = {customer.Id} FOR UPDATE")
+            .FirstAsync(cancellationToken); // every customer has one, created alongside it in CreateCustomerAsync
 
         // Only the field name is ever recorded (e.g. "Bvn set") - never the submitted value. Unlike
         // UpdateDetailsAsync's "FullName old -> new" Details string, the value itself is exactly what
@@ -281,7 +308,11 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
         if (changes.Count == 0)
         {
             // Every supplied field matched what was already stored - a pure no-op. Nothing was mutated on
-            // the tracked entity, so there is nothing to save and nothing to audit.
+            // the tracked entity, so there is nothing to save and nothing to audit. Still commits (rather
+            // than letting the lock release via rollback-on-dispose) for the same "every return path
+            // explicitly resolves the transaction" discipline ApproveAsync follows - harmless here since
+            // nothing was written, but consistent regardless of which branch returns.
+            await transaction.CommitAsync(cancellationToken);
             return ToResponse(customer);
         }
 
@@ -297,6 +328,7 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
         });
 
         await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
         return ToResponse(customer);
     }
 

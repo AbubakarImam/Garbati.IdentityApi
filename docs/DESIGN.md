@@ -1154,6 +1154,17 @@ task closes the BVN/NIN-cardinality half of that gap specifically.
   ("Bvn set"/"Nin set") - the submitted value itself is exactly the kind of thing Section 6.2 forbids
   logging, and that discipline applies to this durable `AuditEvent.Details` text too, not only to Serilog
   request logs. Response stays the unchanged `CustomerResponse` - no `Bvn`/`Nin` property added anywhere.
+  **QA fix (PR #7 review):** the set-once check was originally pure application-level read-then-write
+  with no database-level guard - two concurrent requests for the same customer with *different* values
+  could each read `Bvn`/`Nin` as `null`, each pass the "not yet set" branch, and each successfully save,
+  the second silently overwriting the first with no 409 to either caller. Fixed with a
+  `SELECT ... FOR UPDATE` row lock on the customer's `customer_identity_data` row for the method's
+  duration (same pattern `JointApprovalService.ApproveAsync` already uses for an analogous race) - a real
+  database-enforced guard, not an application-level check alone. A plain unique constraint (the mandate-
+  uniqueness pattern, Section 7.4/decision #19) does not apply here: there is no cross-row uniqueness
+  invariant, only a single row's null-to-value transition that two transactions must not race. Proven by
+  a genuine concurrency test (`SubmitIdentityNumbersAsync_TwoConcurrentRequestsWithDifferentBvnValues_OnlyOneWins`),
+  not two sequential awaited calls.
 - `KycEvidenceTokens.AtLeastOneIdentityNumber`/`.BothIdentityNumbers` - two new entries in the existing,
   already-configurable `RequiredEvidence` jsonb vocabulary (decision #11), not a new hardcoded rule
   bypassing it. A new migration (not an edit to the old `SeedPlaceholderKycTierPolicies` migration) adds
@@ -1196,7 +1207,10 @@ including a raw-SQL-inserted row that never mentions the new columns, proving no
 format validation for too-short/too-long/non-digit/non-ASCII-digit values
 (`SubmitIdentityNumbersRequestValidatorTests`); set-once behavior including a direct database query
 proving a rejected 409 attempt left the stored value unchanged, not just that the response code was right
-(`CustomerServiceTests`); tier-cardinality enforcement for Tier1/Tier2 (at least one) and Tier3 (both),
+(`CustomerServiceTests`); a genuine concurrency repro where two different Bvn values race for the same
+customer via `Task.Run`/`Task.WhenAll` against two independent `DbContext`s, proving exactly one wins and
+the stored value is the winner's, not a mix (`SubmitIdentityNumbersAsync_TwoConcurrentRequestsWithDifferentBvnValues_OnlyOneWins`,
+added in the PR #7 QA follow-up above); tier-cardinality enforcement for Tier1/Tier2 (at least one) and Tier3 (both),
 including that a non-`Verified` decision never triggers the check regardless of what evidence is on file;
 a direct query against the actual `AuditEvent` row proving `Details` never contains the literal submitted
 value; and a real HTTP round trip (`IdentityNumbersHttpTests`) parsing a live response's JSON to prove it

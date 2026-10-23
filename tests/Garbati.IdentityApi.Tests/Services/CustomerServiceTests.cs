@@ -607,6 +607,53 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         Assert.DoesNotContain(submittedBvn, audit.Details!);
     }
 
+    // QA review of this PR (PR #7, §3): the set-once check was pure application-level read-then-write
+    // with no database-level guard - two concurrent requests for the same customer with different values
+    // could both read Bvn as null and both win, the second silently overwriting the first with no 409 to
+    // either caller. Fixed with a SELECT ... FOR UPDATE row lock in SubmitIdentityNumbersAsync (same
+    // pattern JointApprovalService.ApproveAsync already uses for an analogous race). This test is a real
+    // concurrency repro, not two sequential awaited calls: both Task.Run calls are kicked off (via the
+    // lazy Select below, enumerated by Task.WhenAll) before either is awaited, each against its own
+    // DbContext/connection, racing the real Testcontainers Postgres instance - the same shape as the
+    // existing CreateCustomerAsync_ConcurrentRequestsWithOneKeyAndDifferentBodies_OneSucceedsOneConflicts
+    // test above.
+    [Fact]
+    public async Task SubmitIdentityNumbersAsync_TwoConcurrentRequestsWithDifferentBvnValues_OnlyOneWins()
+    {
+        var customerId = await CreateCustomerAsync();
+        var values = new[] { "11111111111", "22222222222" };
+
+        var attempts = values.Select(bvn => Task.Run(async () =>
+        {
+            await using var ctx = fixture.CreateContext();
+            try
+            {
+                await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+                    .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest(bvn, null));
+                return (Bvn: bvn, Outcome: "ok");
+            }
+            catch (IdentityNumberAlreadySetException)
+            {
+                return (Bvn: bvn, Outcome: "conflict");
+            }
+        }));
+
+        var results = await Task.WhenAll(attempts);
+
+        // Exactly one wins and exactly one loses - never both winning (the silent-overwrite bug QA
+        // found) and never both losing (which would mean the row lock deadlocked or misfired).
+        Assert.Single(results, r => r.Outcome == "ok");
+        Assert.Single(results, r => r.Outcome == "conflict");
+
+        // The stored value is exactly the winner's - not corrupted, not the loser's, not some mix of the
+        // two - queried fresh from a third, independent DbContext.
+        var winner = results.Single(r => r.Outcome == "ok").Bvn;
+        await using var verifyCtx = fixture.CreateContext();
+        var customer = await verifyCtx.Customers.SingleAsync(c => c.CustomerId == customerId);
+        var identityData = await verifyCtx.CustomerIdentityData.SingleAsync(d => d.CustomerId == customer.Id);
+        Assert.Equal(winner, identityData.Bvn);
+    }
+
     // T-044: RecordKycDecisionAsync's narrowly-scoped BVN/NIN cardinality enforcement
     // (KycEvidenceTokens.AtLeastOneIdentityNumber/BothIdentityNumbers only).
     [Theory]
