@@ -85,6 +85,11 @@ public class ExceptionHandlingMiddleware(RequestDelegate next, ILogger<Exception
         // T-031 addition (DESIGN.md Section 5.1): a malformed pageToken, same 400-via-exception pattern
         // as InvalidApprovalThresholdException above.
         InvalidPageTokenException => (StatusCodes.Status400BadRequest, "Invalid pageToken."),
+
+        // T-044 additions (garbati-platform D-26): PATCH /v1/customers/{customerId}/identity-numbers'
+        // set-once rule, and RecordKycDecisionAsync's narrowly-scoped BVN/NIN cardinality check.
+        IdentityNumberAlreadySetException => (StatusCodes.Status409Conflict, "Identity number already set."),
+        KycTierEvidenceNotMetException => (StatusCodes.Status422UnprocessableEntity, "KYC tier evidence not met."),
         _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred.")
     };
 }
