@@ -89,19 +89,31 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
 
         Assert.NotNull(response);
         Assert.Equal(customerId, response!.CustomerId);
-        // CustomerResponse has no FullName/Email/PhoneNumber property at all - nothing from
+        // CustomerResponse has no FullName/Email/PhoneNumber/Bvn/Nin property at all - nothing from
         // CustomerIdentityData can leak into it (DESIGN.md Section 6.2). Reflection proves this holds
-        // even if someone edits the record later without checking this test.
+        // even if someone edits the record later without checking this test. Bvn/Nin (T-044) added to
+        // this same list rather than a separate test - it is the identical guarantee, for the two newest
+        // CustomerIdentityData fields.
         var propertyNames = typeof(CustomerResponse).GetProperties().Select(p => p.Name);
         Assert.DoesNotContain("FullName", propertyNames);
         Assert.DoesNotContain("Email", propertyNames);
         Assert.DoesNotContain("PhoneNumber", propertyNames);
+        Assert.DoesNotContain("Bvn", propertyNames);
+        Assert.DoesNotContain("Nin", propertyNames);
     }
 
     [Fact]
     public async Task RecordKycDecisionAsync_Verified_UpdatesStatusAndTier_AndRecordsAVerificationRow()
     {
         var customerId = await CreateCustomerAsync();
+        // T-044 (garbati-platform D-26): granting Tier1 now requires at least one of Bvn/Nin on file -
+        // this test is not about that enforcement itself (see the dedicated RecordKycDecisionAsync_*
+        // tests below for that), so it satisfies it unconditionally first.
+        await using (var submitCtx = fixture.CreateContext())
+        {
+            await new CustomerService(submitCtx, TestAudit.For(submitCtx), TestCaller.Default)
+                .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest("12345678901", null));
+        }
         var request = new KycDecisionRequest("Verified", "Tier1", "BVN", "test-provider", "ref-1", "OK", null);
 
         await using var ctx = fixture.CreateContext();
@@ -501,6 +513,200 @@ public class CustomerServiceTests(PostgresFixture fixture) : IAsyncLifetime
         await Assert.ThrowsAsync<CustomerNotFoundException>(() =>
             new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
                 .UpdateDetailsAsync("CUS-DOESNOTEXIST", new UpdateCustomerDetailsRequest("New Name", null, null)));
+    }
+
+    // T-044 (garbati-platform D-26): PATCH /v1/customers/{customerId}/identity-numbers.
+    [Fact]
+    public async Task SubmitIdentityNumbersAsync_SetsBvnAndNin_WhenNeitherWasPreviouslyStored()
+    {
+        var customerId = await CreateCustomerAsync();
+
+        await using var ctx = fixture.CreateContext();
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest("12345678901", "10987654321"));
+
+        Assert.Equal(customerId, response.CustomerId);
+
+        await using var verifyCtx = fixture.CreateContext();
+        var customer = await verifyCtx.Customers.SingleAsync(c => c.CustomerId == customerId);
+        var identityData = await verifyCtx.CustomerIdentityData.SingleAsync(d => d.CustomerId == customer.Id);
+        Assert.Equal("12345678901", identityData.Bvn);
+        Assert.Equal("10987654321", identityData.Nin);
+    }
+
+    [Fact]
+    public async Task SubmitIdentityNumbersAsync_ResubmittingTheSameValue_IsAnIdempotentNoOp_AndWritesNoAuditRow()
+    {
+        var customerId = await CreateCustomerAsync();
+        await using (var firstCtx = fixture.CreateContext())
+        {
+            await new CustomerService(firstCtx, TestAudit.For(firstCtx), TestCaller.Default)
+                .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest("12345678901", null));
+        }
+
+        await using var ctx = fixture.CreateContext();
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest("12345678901", null));
+
+        Assert.Equal(customerId, response.CustomerId);
+
+        await using var verifyCtx = fixture.CreateContext();
+        // Only the first call wrote an audit row - the idempotent repeat is a pure read (the no-op choice
+        // CustomerService.SubmitIdentityNumbersAsync documents in its own comment: "nothing changed,
+        // nothing to audit").
+        Assert.Equal(1, await verifyCtx.AuditEvents.CountAsync(a => a.Action == AuditActions.IdentityNumberSubmitted));
+    }
+
+    [Fact]
+    public async Task SubmitIdentityNumbersAsync_Throws409_WhenADifferentBvnIsSubmitted_AndLeavesTheStoredValueUnchanged()
+    {
+        var customerId = await CreateCustomerAsync();
+        await using (var firstCtx = fixture.CreateContext())
+        {
+            await new CustomerService(firstCtx, TestAudit.For(firstCtx), TestCaller.Default)
+                .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest("12345678901", null));
+        }
+
+        await using var ctx = fixture.CreateContext();
+        await Assert.ThrowsAsync<IdentityNumberAlreadySetException>(() =>
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+                .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest("99999999999", null)));
+
+        // Not just "no exception escaped" - query the database directly, the same way this platform's
+        // QA process has verified "nothing changed" claims before (the task file's own wording).
+        await using var verifyCtx = fixture.CreateContext();
+        var customer = await verifyCtx.Customers.SingleAsync(c => c.CustomerId == customerId);
+        var identityData = await verifyCtx.CustomerIdentityData.SingleAsync(d => d.CustomerId == customer.Id);
+        Assert.Equal("12345678901", identityData.Bvn);
+    }
+
+    [Fact]
+    public async Task SubmitIdentityNumbersAsync_Throws_ForAnUnknownCustomer()
+    {
+        await using var ctx = fixture.CreateContext();
+        await Assert.ThrowsAsync<CustomerNotFoundException>(() =>
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+                .SubmitIdentityNumbersAsync("CUS-DOESNOTEXIST", new SubmitIdentityNumbersRequest("12345678901", null)));
+    }
+
+    [Fact]
+    public async Task SubmitIdentityNumbersAsync_RecordsAnAuditRow_ThatDoesNotContainTheSubmittedValue()
+    {
+        var customerId = await CreateCustomerAsync();
+        const string submittedBvn = "12345678901";
+
+        await using var ctx = fixture.CreateContext();
+        await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest(submittedBvn, null));
+
+        await using var verifyCtx = fixture.CreateContext();
+        var audit = await verifyCtx.AuditEvents.SingleAsync(a => a.Action == AuditActions.IdentityNumberSubmitted);
+        Assert.Equal(customerId, audit.EntityId);
+        Assert.Equal("Bvn set", audit.Details);
+        // The real, direct assertion the task file calls for - not just "no exception was thrown."
+        Assert.DoesNotContain(submittedBvn, audit.Details!);
+    }
+
+    // T-044: RecordKycDecisionAsync's narrowly-scoped BVN/NIN cardinality enforcement
+    // (KycEvidenceTokens.AtLeastOneIdentityNumber/BothIdentityNumbers only).
+    [Theory]
+    [InlineData("Tier1")]
+    [InlineData("Tier2")]
+    public async Task RecordKycDecisionAsync_GrantsTheTier_WhenAtLeastOneIdentityNumberIsOnFile(string tier)
+    {
+        var customerId = await CreateCustomerAsync();
+        await using (var submitCtx = fixture.CreateContext())
+        {
+            await new CustomerService(submitCtx, TestAudit.For(submitCtx), TestCaller.Default)
+                .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest("12345678901", null));
+        }
+
+        await using var ctx = fixture.CreateContext();
+        var request = new KycDecisionRequest("Verified", tier, "BVN", "test-provider", null, "OK", null);
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .RecordKycDecisionAsync(customerId, request);
+
+        Assert.Equal(tier, response.KycTier);
+    }
+
+    [Theory]
+    [InlineData("Tier1")]
+    [InlineData("Tier2")]
+    public async Task RecordKycDecisionAsync_Throws422_GrantingTheTier_WhenNeitherIdentityNumberIsOnFile(string tier)
+    {
+        var customerId = await CreateCustomerAsync();
+        var request = new KycDecisionRequest("Verified", tier, "BVN", "test-provider", null, "OK", null);
+
+        await using var ctx = fixture.CreateContext();
+        await Assert.ThrowsAsync<KycTierEvidenceNotMetException>(() =>
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).RecordKycDecisionAsync(customerId, request));
+    }
+
+    [Fact]
+    public async Task RecordKycDecisionAsync_GrantsTier3_OnlyWhenBothIdentityNumbersAreOnFile()
+    {
+        var customerId = await CreateCustomerAsync();
+        await using (var submitCtx = fixture.CreateContext())
+        {
+            await new CustomerService(submitCtx, TestAudit.For(submitCtx), TestCaller.Default)
+                .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest("12345678901", "10987654321"));
+        }
+
+        await using var ctx = fixture.CreateContext();
+        var request = new KycDecisionRequest("Verified", "Tier3", "BVN", "test-provider", null, "OK", null);
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .RecordKycDecisionAsync(customerId, request);
+
+        Assert.Equal("Tier3", response.KycTier);
+    }
+
+    [Fact]
+    public async Task RecordKycDecisionAsync_Throws422_GrantingTier3_WhenOnlyOneIdentityNumberIsOnFile()
+    {
+        var customerId = await CreateCustomerAsync();
+        await using (var submitCtx = fixture.CreateContext())
+        {
+            await new CustomerService(submitCtx, TestAudit.For(submitCtx), TestCaller.Default)
+                .SubmitIdentityNumbersAsync(customerId, new SubmitIdentityNumbersRequest("12345678901", null));
+        }
+
+        await using var ctx = fixture.CreateContext();
+        var request = new KycDecisionRequest("Verified", "Tier3", "BVN", "test-provider", null, "OK", null);
+        await Assert.ThrowsAsync<KycTierEvidenceNotMetException>(() =>
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).RecordKycDecisionAsync(customerId, request));
+    }
+
+    [Fact]
+    public async Task RecordKycDecisionAsync_Throws422_AndRecordsNothing_AndLeavesStatusAndTierUnchanged()
+    {
+        var customerId = await CreateCustomerAsync(); // no Bvn/Nin submitted
+        var request = new KycDecisionRequest("Verified", "Tier1", "BVN", "test-provider", null, "OK", null);
+
+        await using var ctx = fixture.CreateContext();
+        await Assert.ThrowsAsync<KycTierEvidenceNotMetException>(() =>
+            new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default).RecordKycDecisionAsync(customerId, request));
+
+        // The whole decision must fail atomically (task file): no KycVerification row, KycStatus/KycTier
+        // untouched - queried directly, not inferred from the exception alone.
+        await using var verifyCtx = fixture.CreateContext();
+        var customer = await verifyCtx.Customers.SingleAsync(c => c.CustomerId == customerId);
+        Assert.Equal(KycStatus.Pending, customer.KycStatus);
+        Assert.Null(customer.KycTier);
+        Assert.Equal(0, await verifyCtx.KycVerifications.CountAsync());
+    }
+
+    [Fact]
+    public async Task RecordKycDecisionAsync_ANonVerifiedDecision_NeverTriggersTheEvidenceCheck_RegardlessOfWhatIsOnFile()
+    {
+        var customerId = await CreateCustomerAsync(); // no Bvn/Nin submitted - would fail any tier grant
+        var request = new KycDecisionRequest("Rejected", null, "BVN", "test-provider", null, "MISMATCH", null);
+
+        await using var ctx = fixture.CreateContext();
+        var response = await new CustomerService(ctx, TestAudit.For(ctx), TestCaller.Default)
+            .RecordKycDecisionAsync(customerId, request);
+
+        Assert.Equal("Rejected", response.KycStatus);
+        Assert.Null(response.KycTier);
     }
 
     [Theory]

@@ -55,6 +55,7 @@ public class CustomersControllerTests
         public int CloseCalls { get; private set; }
         public int MarkDeceasedCalls { get; private set; }
         public int UpdateDetailsCalls { get; private set; }
+        public int SubmitIdentityNumbersCalls { get; private set; }
 
         public Task<CustomerResponse> CreateCustomerAsync(CreateCustomerRequest request, CancellationToken cancellationToken = default)
         {
@@ -97,6 +98,12 @@ public class CustomersControllerTests
             UpdateDetailsCalls++;
             return Task.FromResult(customer!);
         }
+
+        public Task<CustomerResponse> SubmitIdentityNumbersAsync(string customerId, SubmitIdentityNumbersRequest request, CancellationToken cancellationToken = default)
+        {
+            SubmitIdentityNumbersCalls++;
+            return Task.FromResult(customer!);
+        }
     }
 
     private static CustomersController CreateController(StubCustomerService service, StubMandateService? mandateService = null) => new(
@@ -106,7 +113,8 @@ public class CustomersControllerTests
         new KycDecisionRequestValidator(),
         new CustomerStatusChangeRequestValidator(),
         new AttachMandateRequestValidator(),
-        new UpdateCustomerDetailsRequestValidator());
+        new UpdateCustomerDetailsRequestValidator(),
+        new SubmitIdentityNumbersRequestValidator());
 
     [Fact]
     public async Task CreateCustomer_Returns200_WithTheCreatedCustomer()
@@ -343,6 +351,48 @@ public class CustomersControllerTests
         var errors = Assert.IsAssignableFrom<IReadOnlyList<string>>(badRequest.Value);
         Assert.Contains(errors, e => e.Contains("FullName"));
         Assert.Equal(0, service.UpdateDetailsCalls);
+    }
+
+    [Fact]
+    public async Task SubmitIdentityNumbers_Returns200_WithAValidRequest()
+    {
+        var controller = CreateController(new StubCustomerService(Customer));
+
+        var result = await controller.SubmitIdentityNumbers(
+            "CUS-ABCDEFGHJKLMNPQ", new SubmitIdentityNumbersRequest("12345678901", null), CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result.Result);
+        Assert.Equal(Customer, ok.Value);
+    }
+
+    [Fact]
+    public async Task SubmitIdentityNumbers_Returns400_AndDoesNotCallTheService_WhenBothFieldsAreNull()
+    {
+        var service = new StubCustomerService(Customer);
+        var controller = CreateController(service);
+
+        var result = await controller.SubmitIdentityNumbers(
+            "CUS-ABCDEFGHJKLMNPQ", new SubmitIdentityNumbersRequest(null, null), CancellationToken.None);
+
+        var badRequest = Assert.IsType<BadRequestObjectResult>(result.Result);
+        var errors = Assert.IsAssignableFrom<IReadOnlyList<string>>(badRequest.Value);
+        Assert.NotEmpty(errors);
+        Assert.Equal(0, service.SubmitIdentityNumbersCalls);
+    }
+
+    [Fact]
+    public async Task SubmitIdentityNumbers_Returns400_AndDoesNotCallTheService_WhenBvnIsNotElevenDigits()
+    {
+        var service = new StubCustomerService(Customer);
+        var controller = CreateController(service);
+
+        var result = await controller.SubmitIdentityNumbers(
+            "CUS-ABCDEFGHJKLMNPQ", new SubmitIdentityNumbersRequest("short", null), CancellationToken.None);
+
+        var badRequest = Assert.IsType<BadRequestObjectResult>(result.Result);
+        var errors = Assert.IsAssignableFrom<IReadOnlyList<string>>(badRequest.Value);
+        Assert.Contains(errors, e => e.Contains("Bvn"));
+        Assert.Equal(0, service.SubmitIdentityNumbersCalls);
     }
 
     [Fact]
