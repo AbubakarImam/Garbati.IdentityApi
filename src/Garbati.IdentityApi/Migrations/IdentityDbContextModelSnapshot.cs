@@ -304,6 +304,10 @@ namespace Garbati.IdentityApi.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
+                    b.Property<string>("Bvn")
+                        .HasColumnType("text")
+                        .HasColumnName("bvn");
+
                     b.Property<DateTimeOffset>("CreatedAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("created_at");
@@ -320,6 +324,10 @@ namespace Garbati.IdentityApi.Migrations
                         .IsRequired()
                         .HasColumnType("text")
                         .HasColumnName("full_name");
+
+                    b.Property<string>("Nin")
+                        .HasColumnType("text")
+                        .HasColumnName("nin");
 
                     b.Property<string>("PhoneNumber")
                         .HasColumnType("text")

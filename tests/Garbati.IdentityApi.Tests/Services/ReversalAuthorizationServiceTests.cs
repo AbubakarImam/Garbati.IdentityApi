@@ -59,6 +59,12 @@ public class ReversalAuthorizationServiceTests(PostgresFixture fixture) : IAsync
 
         if (kycTier is not null)
         {
+            // T-044 (garbati-platform D-26): granting any tier now requires at least one of Bvn/Nin on
+            // file (Tier3 requires both) - this helper is not testing that enforcement itself
+            // (CustomerServiceTests.cs covers it directly), so it satisfies it unconditionally here with
+            // a throwaway, never-asserted-on value.
+            await customerService.SubmitIdentityNumbersAsync(
+                response.CustomerId, new SubmitIdentityNumbersRequest("12345678901", "10987654321"));
             await customerService.RecordKycDecisionAsync(
                 response.CustomerId, new KycDecisionRequest("Verified", kycTier, "BVN", "test-provider", null, "OK", null));
         }

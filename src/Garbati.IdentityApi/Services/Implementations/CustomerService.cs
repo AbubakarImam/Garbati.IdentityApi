@@ -163,9 +163,11 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
         var previousStatus = customer.KycStatus;
         var previousTier = customer.KycTier;
         customer.KycStatus = newStatus;
-        // A tier is only meaningful once verified; a Rejected/Expired/Pending decision does not change it.
+        // A tier is only meaningful once verified; a Rejected/Expired/Pending decision does not change it,
+        // and - per the guard below - never needs the evidence check either (T-044).
         if (newStatus == KycStatus.Verified)
         {
+            await EnsureIdentityNumberEvidenceIsMetAsync(customer, request.KycTier!, cancellationToken);
             customer.KycTier = request.KycTier;
         }
         customer.UpdatedAt = now;
@@ -180,6 +182,153 @@ public class CustomerService(IdentityDbContext dbContext, IAuditLogger auditLogg
         });
 
         await dbContext.SaveChangesAsync(cancellationToken);
+        return ToResponse(customer);
+    }
+
+    // T-044 (garbati-platform D-26): the narrowly-scoped half of KycTierPolicy.RequiredEvidence this
+    // task enforces - AtLeastOneIdentityNumber/BothIdentityNumbers only (Entities/KycEvidenceTokens.cs).
+    // Deliberately does NOT look at SelfDeclaredIdentity/GovernmentId/SourceOfFunds, which have no
+    // backing data anywhere in the system yet - see the task file's "Enforcement scope" section for why
+    // enforcing those now would make Tier2/Tier3 permanently ungrantable.
+    //
+    // "Currently effective" mirrors KycTierPolicy's own EffectiveFrom/EffectiveTo shape; no matching row
+    // at all (wrong jurisdiction/tier, or a tier that was never seeded) is treated as "nothing to check" -
+    // the same as today's behaviour before this task existed (RequiredEvidence was never read anywhere),
+    // not a new 500 and not an invented new failure mode.
+    private async Task EnsureIdentityNumberEvidenceIsMetAsync(Customer customer, string tierCode, CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var policy = await dbContext.KycTierPolicies.AsNoTracking()
+            .Where(p => p.JurisdictionCode == customer.JurisdictionCode && p.TierCode == tierCode
+                && p.EffectiveFrom <= now && (p.EffectiveTo == null || p.EffectiveTo > now))
+            .OrderByDescending(p => p.EffectiveFrom)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (policy is null)
+        {
+            return;
+        }
+
+        var identityData = customer.IdentityData!; // every customer has one, created alongside it in CreateCustomerAsync
+        var hasBvn = identityData.Bvn is not null;
+        var hasNin = identityData.Nin is not null;
+
+        if (policy.RequiredEvidence.Contains(KycEvidenceTokens.BothIdentityNumbers) && !(hasBvn && hasNin))
+        {
+            throw new KycTierEvidenceNotMetException(
+                $"KycTier {tierCode} requires both Bvn and Nin to be on file for this customer.");
+        }
+
+        if (policy.RequiredEvidence.Contains(KycEvidenceTokens.AtLeastOneIdentityNumber) && !(hasBvn || hasNin))
+        {
+            throw new KycTierEvidenceNotMetException(
+                $"KycTier {tierCode} requires at least one of Bvn or Nin to be on file for this customer.");
+        }
+    }
+
+    // T-044 (garbati-platform D-26): PATCH /v1/customers/{customerId}/identity-numbers. Its own endpoint,
+    // separate from UpdateDetailsAsync (T-035), because Bvn/Nin are set-once, not freely editable - see
+    // the task file for why a channel that lets someone silently swap a stored BVN/NIN is a fraud vector.
+    // No admin-override path exists in this task; a real correction process is a deliberate future
+    // follow-up, not a side effect of this endpoint.
+    //
+    // No-op choice (task file: "your call, document which you chose and why"): resubmitting the exact
+    // value already on file writes NO audit row. Chosen because the audit trail should describe an
+    // actual change, and "the caller re-sent the same correct value" is not one - the same reasoning
+    // ChangeStatusAsync's own idempotent-repeat branches (Suspend/Reactivate) already use, which likewise
+    // return early without auditing anything when nothing actually changed.
+    public async Task<CustomerResponse> SubmitIdentityNumbersAsync(
+        string customerId, SubmitIdentityNumbersRequest request, CancellationToken cancellationToken = default)
+    {
+        // QA-flagged concurrency fix (PR #7 review): without a row lock, two concurrent PATCH requests
+        // for the SAME customer with DIFFERENT values could each read Bvn/Nin as null, each pass the
+        // "not yet set" branch, and each successfully SaveChangesAsync - the second silently overwrites
+        // the first with no 409 to either caller, exactly the fraud scenario this endpoint exists to
+        // close. SELECT ... FOR UPDATE locks this customer's identity-data row for the rest of this
+        // method, so a concurrent call for the same customer blocks until this one commits (or rolls
+        // back) and then sees the now-set value - a real database-enforced guard (Postgres blocking the
+        // second transaction), not an application-level check alone. Same category of problem, same
+        // fix shape, as JointApprovalService.ApproveAsync's own FOR UPDATE lock (that one on
+        // pending_approval_requests; this one on customer_identity_data) - and the same reason a plain
+        // unique constraint (DESIGN.md 7.4/decision #19's pattern for mandate uniqueness) doesn't apply
+        // here: there is no cross-row uniqueness invariant to enforce, only a single row's null-to-value
+        // transition that two transactions must not race.
+        //
+        // The customer itself is read AsNoTracking and never locked or mutated here (T-044 doesn't touch
+        // Customer.UpdatedAt - see UpdateDetailsAsync's own precedent below) - only the identity-data row
+        // needs the lock. FromSqlInterpolated, not Include() off a locked Customer query, for the same
+        // reason JointApprovalService avoids FOR UPDATE through an outer join: Customer.IdentityData is
+        // nullable at the schema level (the FK lives on CustomerIdentityData), so Include() would compose
+        // a LEFT JOIN, and Postgres refuses FOR UPDATE on the nullable side of one.
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+
+        var customer = await dbContext.Customers.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.CustomerId == customerId, cancellationToken)
+            ?? throw new CustomerNotFoundException($"Customer '{customerId}' was not found.");
+
+        var identityData = await dbContext.CustomerIdentityData
+            .FromSqlInterpolated($"SELECT * FROM customer_identity_data WHERE customer_id = {customer.Id} FOR UPDATE")
+            .FirstAsync(cancellationToken); // every customer has one, created alongside it in CreateCustomerAsync
+
+        // Only the field name is ever recorded (e.g. "Bvn set") - never the submitted value. Unlike
+        // UpdateDetailsAsync's "FullName old -> new" Details string, the value itself is exactly what
+        // ARCHITECTURE.md Section 5 and DESIGN.md Section 6.2 forbid logging, and that discipline applies
+        // to this durable AuditEvent.Details text too, not only to Serilog request logs.
+        var changes = new List<string>();
+
+        if (request.Bvn is not null)
+        {
+            if (identityData.Bvn is null)
+            {
+                identityData.Bvn = request.Bvn;
+                changes.Add("Bvn set");
+            }
+            else if (identityData.Bvn != request.Bvn)
+            {
+                throw new IdentityNumberAlreadySetException(
+                    "Bvn is already set for this customer and cannot be changed via this endpoint.");
+            }
+            // else: the same value was resubmitted - idempotent no-op, nothing to change or record.
+        }
+
+        if (request.Nin is not null)
+        {
+            if (identityData.Nin is null)
+            {
+                identityData.Nin = request.Nin;
+                changes.Add("Nin set");
+            }
+            else if (identityData.Nin != request.Nin)
+            {
+                throw new IdentityNumberAlreadySetException(
+                    "Nin is already set for this customer and cannot be changed via this endpoint.");
+            }
+        }
+
+        if (changes.Count == 0)
+        {
+            // Every supplied field matched what was already stored - a pure no-op. Nothing was mutated on
+            // the tracked entity, so there is nothing to save and nothing to audit. Still commits (rather
+            // than letting the lock release via rollback-on-dispose) for the same "every return path
+            // explicitly resolves the transaction" discipline ApproveAsync follows - harmless here since
+            // nothing was written, but consistent regardless of which branch returns.
+            await transaction.CommitAsync(cancellationToken);
+            return ToResponse(customer);
+        }
+
+        identityData.UpdatedAt = DateTimeOffset.UtcNow;
+
+        auditLogger.Record(new AuditEvent
+        {
+            Action = AuditActions.IdentityNumberSubmitted,
+            EntityType = nameof(Customer),
+            EntityId = customer.CustomerId,
+            Status = customer.CustomerStatus.ToString(),
+            Details = string.Join("; ", changes),
+        });
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
         return ToResponse(customer);
     }
 

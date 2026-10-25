@@ -38,4 +38,11 @@ public static class AuditActions
     // PATCH /v1/customers/{customerId}/details, the maker-checker edit OpsApi's T-034 workflow applies
     // once a CustomerServiceOfficer's staged change is Supervisor-approved.
     public const string CustomerDetailsUpdated = "CustomerDetailsUpdated";
+
+    // T-044 addition (DESIGN.md Section 6.3, garbati-platform D-26): PATCH
+    // /v1/customers/{customerId}/identity-numbers. Recorded only when a value actually changes (the
+    // set-once no-op case writes no audit row - see CustomerService.SubmitIdentityNumbersAsync's own
+    // comment for why). Details names only which field(s) changed ("Bvn set"/"Nin set") - never the
+    // submitted value itself (ARCHITECTURE.md Section 5: "Logs never contain identity numbers").
+    public const string IdentityNumberSubmitted = "IdentityNumberSubmitted";
 }
