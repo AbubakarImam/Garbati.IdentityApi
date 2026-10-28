@@ -271,6 +271,8 @@ Unchanged from v1. Authorization grants expire 30 seconds after issuance. The de
 
 Unchanged from v1. A valid signature alone does not prevent replay; LedgerApi binds use of the grant to the exact request and enforces its existing idempotency rules. For a grant arriving after expiry, LedgerApi rejects it; the orchestrator/channel may request a fresh authorization.
 
+**T-049 (`garbati-platform` D-16), 28 Oct 2026: a retried *denial* now dedupes; a retried *approval* still does not, deliberately.** A client retry of `RequestAuthorizationAsync` that results in approval always mints a fresh `DecisionId` and grant, exactly as before — there is nothing persisted to replay (decision #13: the signed grant itself is never stored), and LedgerApi's own idempotency constraint (`ix_transactions_initiated_by_idempotency_key`) is the real money-safety backstop regardless of how many grants IdentityApi issues for the same logical request. A retried *denial*, however, is pure waste with no money-safety angle either way: before this fix it wrote a second, independent `AuthorizationDecision` row and a second `AuthorizationDenied` audit event for one logical request. `PersistDecisionAsync` now resolves this the same way `CustomerService.CreateCustomerAsync` resolves a reused idempotency key: a new partial unique index on `(RequestedBy, IdempotencyKey) WHERE Approved = false` lets the insert itself detect the duplicate; on conflict, the existing denied row is looked up, its canonical request fields are compared against the new request, and either the original decision is returned (same request) or `DuplicateIdempotencyKeyException` is thrown (409, a different request reusing the same key). See Appendix I.
+
 ### 3.8 Joint-account approval workflow (v2, new)
 
 This section only applies when an account's `MandateApprovalPolicy.RequiredApprovals > 1`. For `RequiredApprovals = 1` (the ordinary case), nothing here changes 3.2–3.7: one holder's own mandate is enough.
@@ -1215,6 +1217,76 @@ including that a non-`Verified` decision never triggers the check regardless of 
 a direct query against the actual `AuditEvent` row proving `Details` never contains the literal submitted
 value; and a real HTTP round trip (`IdentityNumbersHttpTests`) parsing a live response's JSON to prove it
 carries no `bvn`/`nin` key, not relying on `CustomerResponse` having no such property as the only proof.
+
+---
+
+## Appendix I. T-049 build notes (retried-denial idempotency)
+
+This appendix records what `garbati-platform` T-049 (D-16) actually built. D-16 found that
+`AuthorizationService.RequestAuthorizationAsync` mints a fresh `Guid.NewGuid()` `DecisionId` and writes a
+brand-new `AuthorizationDecision` row on *every* call, with no lookup by `IdempotencyKey` anywhere — a
+client retry (lost response, timeout) therefore produces a second, independent decision for what was
+really one logical request. The owner's decision (`garbati-platform/TASKS.md` D-16, 28 Oct 2026,
+confirming no separate migration sign-off gate was needed beyond that decision itself): dedupe the
+*denial* case only; a retried *approval* keeps minting a fresh grant, unchanged.
+
+**Built:**
+
+- New partial unique index `ix_authorization_decisions_requested_by_idempotency_key_denied` on
+  `AuthorizationDecision(RequestedBy, IdempotencyKey)`, `WHERE Approved = false`. Purely additive — it
+  creates an index only, mutates no existing row. **Why partial, not a plain unique index:** a plain
+  unique index on the same two columns would also block the second row a retried *approval* is supposed
+  to get under the owner's decision above; the `WHERE Approved = false` filter means Postgres only
+  enforces uniqueness among denied decisions, leaving every approved insert — including a retried one —
+  completely outside what the index even looks at.
+- `AuthorizationService.PersistDecisionAsync`: the existing `SaveChangesAsync` call is now wrapped in a
+  try/catch mirroring `CustomerService.CreateCustomerAsync`'s exact shape (attempt the insert directly, no
+  separate "check first" read, which would reintroduce the exact race the constraint exists to close).
+  On `DbUpdateException` with the new index's Postgres unique-violation (and only when `!approved` — an
+  approved insert never hits this index's filter, so that case always falls through to the unchanged
+  `return decision;`): detach the staged `AuthorizationDecision` and the staged `AuditEvent` (confirmed
+  `IAuditLogger.Record` returns the same tracked entity `CreateCustomerAsync` detaches — both needed
+  detaching for the same reason), re-query the existing denied row by `(RequestedBy, IdempotencyKey)`,
+  compare the request's own canonical fields (`Operation`, `DebitAccountId`, `CreditAccountId`, `Amount`,
+  `Currency` — not computed outputs like `DenialReason`) against it, and either return the existing
+  decision (same request) or throw `DuplicateIdempotencyKeyException` (a different request reusing the
+  same key, 409).
+- `RequestAuthorizationAsync`'s denial branch now throws `AuthorizationDeniedException` using the
+  `DecisionId`/`DenialReason` that `PersistDecisionAsync` actually returns, not the `decisionId` it
+  generated locally before the call — on a resolved duplicate, that local id was a fresh guid that was
+  never actually persisted, so a caller holding it could never successfully `GetDecisionAsync` it. A
+  retried denial now surfaces the *original* decision's real identity.
+- `RecordDenialAsync` — `JointApprovalService`'s only caller of the denial path — needed **no change**:
+  its own return type is `Task`, not `Task<AuthorizationDecision>`, so it already discards the entity
+  `PersistDecisionAsync` returns; `JointApprovalService.cs` itself is therefore completely unmodified by
+  this task and benefits from the dedup automatically the next time `RecordDenialAsync` is called with a
+  repeated key.
+
+**Deliberately not built (scope boundary, confirmed before starting, not an oversight):**
+
+- **`ReversalAuthorizationService.RequestReversalAsync`** — read directly before starting: it has no
+  denial branch at all. Per decision #31, the ops channel's own maker-checker already gates a reversal
+  request before this method is ever called; every call here unconditionally sets `Approved = true`.
+  There is nothing to dedupe on that path, and the file is untouched by this task.
+- **A `RequestHash` column**, unlike `CustomerService`'s pattern. Every field needed to detect "same key,
+  different body" (`Operation`, `DebitAccountId`, `CreditAccountId`, `Amount`, `Currency`) already exists
+  as a plain column on `AuthorizationDecision` — adding a hash column alongside them would be a second,
+  redundant way to ask the same question.
+- **Any change to the *approved*-retry behavior.** A retry of an approved request still gets a fresh
+  `DecisionId` and a fresh grant, exactly as today — see 3.7's regression-test note above. This is the
+  decision the task was explicitly scoped around, not a gap.
+
+**Tests (`AuthorizationServiceTests`, `MigrationTests`):** a retried identical denial returns the same
+`DecisionId`/`DenialReason` and leaves exactly one row and one `AuthorizationDenied` audit event; the same
+key with a different `Amount` throws `DuplicateIdempotencyKeyException` and leaves the original row's
+`Amount`/`DecisionId` untouched; a different idempotency key for the same `RequestedBy` persists both
+denials independently; an approved request retried with the same key still gets a second row with a fresh
+`DecisionId` (the regression test for the easiest way to get this wrong); the migration applies cleanly
+and the index is confirmed to actually exist, be unique, and be filtered via `pg_indexes`/`indexdef` (not
+just what the C# model claims to have asked for), plus a raw-SQL-insert test proving the database itself
+blocks two denied rows for the same `(RequestedBy, IdempotencyKey)` while allowing two approved rows for
+that exact same pair. `JointApprovalService`'s existing denial-path tests needed no changes and were
+confirmed passing unchanged by running the full suite.
 `AuthorizationTests.Endpoints` gained a new theory row for the existing 401/403/reaches-endpoint scope
 coverage. Four pre-existing test files (`AuthorizationServiceTests`, `JointApprovalServiceTests`,
 `ReversalAuthorizationServiceTests`, and one test in `CustomerServiceTests` itself) that grant a KYC tier
