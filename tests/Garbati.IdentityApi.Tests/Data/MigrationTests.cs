@@ -24,6 +24,7 @@ public class MigrationTests(PostgresFixture fixture)
         Assert.Contains(applied, m => m.EndsWith("AddReversalAuthorization"));
         Assert.Contains(applied, m => m.EndsWith("AddBvnNinToCustomerIdentityData"));
         Assert.Contains(applied, m => m.EndsWith("AddBvnNinCardinalityToKycTierPolicies"));
+        Assert.Contains(applied, m => m.EndsWith("AddAuthorizationDenialIdempotency"));
     }
 
     [Fact]
@@ -147,6 +148,76 @@ public class MigrationTests(PostgresFixture fixture)
 
         Assert.Null(identityData.Bvn);
         Assert.Null(identityData.Nin);
+    }
+
+    // T-049 (garbati-platform D-16): confirms the new index actually exists, is unique, and - critically -
+    // is actually filtered (`WHERE approved = false`), via pg_indexes/pg_get_indexdef, which is the real
+    // source of truth for what Postgres enforces (not just what the C# model claims to have asked for).
+    [Fact]
+    public async Task AuthorizationDenialIdempotencyIndex_ExistsAndIsFilteredOnApprovedFalse()
+    {
+        await using var ctx = fixture.CreateContext();
+        var connection = ctx.Database.GetDbConnection();
+        if (connection.State != System.Data.ConnectionState.Open)
+        {
+            await connection.OpenAsync();
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT indexdef FROM pg_indexes
+            WHERE tablename = 'authorization_decisions'
+              AND indexname = 'ix_authorization_decisions_requested_by_idempotency_key_denied'
+            """;
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync(), "Expected index was not found via pg_indexes.");
+        var indexDef = reader.GetString(0);
+
+        Assert.Contains("UNIQUE", indexDef, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("requested_by", indexDef);
+        Assert.Contains("idempotency_key", indexDef);
+        Assert.Contains("WHERE (approved = false)", indexDef);
+    }
+
+    // Confirms what the index actually enforces, not just that it exists: two DENIED rows with the same
+    // (requested_by, idempotency_key) collide at the database level, but two APPROVED rows with the exact
+    // same pair do not - proving the `WHERE approved = false` filter is respected, not just declared.
+    // Inserted directly via raw SQL (bypassing AuthorizationService entirely) so this is a real test of
+    // the database constraint itself, independent of any application-level logic.
+    [Fact]
+    public async Task AuthorizationDenialIdempotencyIndex_BlocksTwoDeniedRows_ButAllowsTwoApprovedRows()
+    {
+        await using var ctx = fixture.CreateContext();
+
+        var requestedBy = $"CUS-MIGTEST-{Guid.NewGuid():N}";
+        var idempotencyKey = $"migtest-key-{Guid.NewGuid():N}";
+
+        async Task InsertDecisionAsync(string decisionId, bool approved)
+        {
+            await ctx.Database.ExecuteSqlInterpolatedAsync($"""
+                INSERT INTO authorization_decisions
+                    (decision_id, requested_by, operation, debit_account_id, credit_account_id,
+                     amount, currency, idempotency_key, approved, denial_reason, created_at)
+                VALUES
+                    ({decisionId}, {requestedBy}, 'Debit', 'ACC-1', 'ACC-2',
+                     '5000', 'NGN', {idempotencyKey}, {approved}, {(string?)(approved ? null : "NoActiveMandate")}, now())
+                """);
+        }
+
+        // Two APPROVED rows, same (requested_by, idempotency_key): must NOT violate the filtered index.
+        await InsertDecisionAsync(Guid.NewGuid().ToString(), approved: true);
+        await InsertDecisionAsync(Guid.NewGuid().ToString(), approved: true);
+
+        // First DENIED row: succeeds. Second DENIED row with the same pair: must violate the index.
+        await InsertDecisionAsync(Guid.NewGuid().ToString(), approved: false);
+
+        // Raw SQL via ExecuteSqlRawAsync surfaces the driver's own exception directly (unlike
+        // SaveChangesAsync, which EF wraps in DbUpdateException) - AuthorizationServiceTests already
+        // covers the DbUpdateException-wrapped shape end to end through the real service.
+        var ex = await Assert.ThrowsAsync<Npgsql.PostgresException>(
+            () => InsertDecisionAsync(Guid.NewGuid().ToString(), approved: false));
+        Assert.Equal("23505", ex.SqlState);
+        Assert.Equal("ix_authorization_decisions_requested_by_idempotency_key_denied", ex.ConstraintName);
     }
 
     private static async Task AssertColumnsAsync(Microsoft.EntityFrameworkCore.DbContext ctx, string table, params string[] expectedColumns)

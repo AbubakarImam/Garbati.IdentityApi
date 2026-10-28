@@ -70,8 +70,9 @@ public class AuthorizationServiceTests(PostgresFixture fixture) : IAsyncLifetime
         return mandate.MandateId;
     }
 
-    private static AuthorizationRequest Request(string customerId, string debitAccountId = "ACC-1", string operation = "Debit", decimal amount = 5000m) =>
-        new(customerId, operation, debitAccountId, "ACC-2", amount, "NGN", $"idem-{Guid.NewGuid()}");
+    private static AuthorizationRequest Request(
+        string customerId, string debitAccountId = "ACC-1", string operation = "Debit", decimal amount = 5000m, string? idempotencyKey = null) =>
+        new(customerId, operation, debitAccountId, "ACC-2", amount, "NGN", idempotencyKey ?? $"idem-{Guid.NewGuid()}");
 
     private static TokenValidationParameters PublicKeyValidationParameters()
     {
@@ -297,6 +298,105 @@ public class AuthorizationServiceTests(PostgresFixture fixture) : IAsyncLifetime
         var result = await handler.ValidateTokenAsync(tampered, PublicKeyValidationParameters());
 
         Assert.False(result.IsValid);
+    }
+
+    // T-049 (garbati-platform D-16): a retried DENIAL must dedupe (one row, one audit event, the same
+    // DecisionId/DenialReason surfaced back), while a retried APPROVAL must keep minting a fresh grant -
+    // the partial unique index (`WHERE approved = false`) is what makes both true at once.
+
+    [Fact]
+    public async Task RequestAuthorizationAsync_RetriedDenial_ReturnsTheSameDecision_AndCreatesOnlyOneRow()
+    {
+        // No mandate on ACC-1 -> NoActiveMandate denial, deterministic and repeatable.
+        var customerId = await CreateCustomerAsync();
+        var request = Request(customerId, idempotencyKey: "denial-key-1");
+
+        await using var ctx1 = fixture.CreateContext();
+        var ex1 = await Assert.ThrowsAsync<AuthorizationDeniedException>(
+            () => new AuthorizationService(ctx1, TestAudit.For(ctx1), CreateGrantSigner()).RequestAuthorizationAsync(request));
+
+        await using var ctx2 = fixture.CreateContext();
+        var ex2 = await Assert.ThrowsAsync<AuthorizationDeniedException>(
+            () => new AuthorizationService(ctx2, TestAudit.For(ctx2), CreateGrantSigner()).RequestAuthorizationAsync(request));
+
+        Assert.Equal(ex1.DecisionId, ex2.DecisionId);
+        Assert.Equal(ex1.ReasonCode, ex2.ReasonCode);
+        Assert.Equal(AuthorizationDenialReasons.NoActiveMandate, ex2.ReasonCode);
+
+        await using var verifyCtx = fixture.CreateContext();
+        Assert.Equal(1, await verifyCtx.AuthorizationDecisions
+            .CountAsync(d => d.RequestedBy == customerId && d.IdempotencyKey == "denial-key-1"));
+        Assert.Equal(1, await verifyCtx.AuditEvents
+            .CountAsync(a => a.Action == AuditActions.AuthorizationDenied && a.EntityId == ex1.DecisionId));
+    }
+
+    [Fact]
+    public async Task RequestAuthorizationAsync_RetriedDenialWithADifferentAmount_Throws409_AndLeavesTheOriginalRowUntouched()
+    {
+        var customerId = await CreateCustomerAsync();
+        var request = Request(customerId, idempotencyKey: "denial-key-2", amount: 5000m);
+
+        await using var ctx1 = fixture.CreateContext();
+        var ex1 = await Assert.ThrowsAsync<AuthorizationDeniedException>(
+            () => new AuthorizationService(ctx1, TestAudit.For(ctx1), CreateGrantSigner()).RequestAuthorizationAsync(request));
+
+        var differentAmountRequest = request with { Amount = 7000m };
+
+        await using var ctx2 = fixture.CreateContext();
+        await Assert.ThrowsAsync<DuplicateIdempotencyKeyException>(
+            () => new AuthorizationService(ctx2, TestAudit.For(ctx2), CreateGrantSigner()).RequestAuthorizationAsync(differentAmountRequest));
+
+        await using var verifyCtx = fixture.CreateContext();
+        var stored = await verifyCtx.AuthorizationDecisions.AsNoTracking()
+            .SingleAsync(d => d.RequestedBy == customerId && d.IdempotencyKey == "denial-key-2");
+        Assert.Equal(ex1.DecisionId, stored.DecisionId);
+        Assert.Equal(5000m.ToString("G29", CultureInfo.InvariantCulture), stored.Amount);
+    }
+
+    [Fact]
+    public async Task RequestAuthorizationAsync_SameRequesterDifferentIdempotencyKey_PersistsBothDenialsIndependently()
+    {
+        var customerId = await CreateCustomerAsync();
+
+        await using var ctx1 = fixture.CreateContext();
+        var ex1 = await Assert.ThrowsAsync<AuthorizationDeniedException>(
+            () => new AuthorizationService(ctx1, TestAudit.For(ctx1), CreateGrantSigner())
+                .RequestAuthorizationAsync(Request(customerId, idempotencyKey: "denial-key-3a")));
+
+        await using var ctx2 = fixture.CreateContext();
+        var ex2 = await Assert.ThrowsAsync<AuthorizationDeniedException>(
+            () => new AuthorizationService(ctx2, TestAudit.For(ctx2), CreateGrantSigner())
+                .RequestAuthorizationAsync(Request(customerId, idempotencyKey: "denial-key-3b")));
+
+        Assert.NotEqual(ex1.DecisionId, ex2.DecisionId);
+
+        await using var verifyCtx = fixture.CreateContext();
+        Assert.Equal(2, await verifyCtx.AuthorizationDecisions.CountAsync(d => d.RequestedBy == customerId && !d.Approved
+            && (d.IdempotencyKey == "denial-key-3a" || d.IdempotencyKey == "denial-key-3b")));
+    }
+
+    // Regression test (task file: "the easiest way to get this wrong"): the partial index's
+    // `WHERE approved = false` filter must mean an approved retry is never blocked by it.
+    [Fact]
+    public async Task RequestAuthorizationAsync_RetriedApproval_StillIssuesASecondRow_WithAFreshDecisionId()
+    {
+        var customerId = await CreateCustomerAsync();
+        await AttachMandateAsync(customerId, "ACC-1", "Debit");
+        var request = Request(customerId, idempotencyKey: "approval-key-1");
+
+        await using var ctx1 = fixture.CreateContext();
+        var first = await new AuthorizationService(ctx1, TestAudit.For(ctx1), CreateGrantSigner()).RequestAuthorizationAsync(request);
+
+        await using var ctx2 = fixture.CreateContext();
+        var retry = await new AuthorizationService(ctx2, TestAudit.For(ctx2), CreateGrantSigner()).RequestAuthorizationAsync(request);
+
+        Assert.True(first.Decision.Approved);
+        Assert.True(retry.Decision.Approved);
+        Assert.NotEqual(first.Decision.DecisionId, retry.Decision.DecisionId);
+
+        await using var verifyCtx = fixture.CreateContext();
+        Assert.Equal(2, await verifyCtx.AuthorizationDecisions
+            .CountAsync(d => d.RequestedBy == customerId && d.IdempotencyKey == "approval-key-1" && d.Approved));
     }
 
     [Fact]
