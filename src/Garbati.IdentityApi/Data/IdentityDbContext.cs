@@ -154,6 +154,18 @@ public class IdentityDbContext(DbContextOptions<IdentityDbContext> options) : Db
         {
             entity.HasKey(d => d.Id);
             entity.HasIndex(d => d.DecisionId).IsUnique();
+
+            // garbati-platform D-16/T-049 (#TBD-1): dedupe a RETRIED DENIAL only. A plain unique index on
+            // (RequestedBy, IdempotencyKey) would also block the second row a retried APPROVAL is supposed
+            // to get (the owner's decision: approved retries keep minting a fresh grant - there is no
+            // persisted grant to replay, decision #13, and LedgerApi's own idempotency constraint is the
+            // real money-safety backstop regardless). The `WHERE approved = false` filter means Postgres
+            // only enforces uniqueness among denied decisions, leaving every approved insert - including a
+            // retried one - completely unaffected by this index.
+            entity.HasIndex(d => new { d.RequestedBy, d.IdempotencyKey })
+                .IsUnique()
+                .HasFilter("approved = false")
+                .HasDatabaseName("ix_authorization_decisions_requested_by_idempotency_key_denied");
         });
 
         // DESIGN.md Section 3.8.2/7.1, T-018. RequestId is the public, nonce-equivalent identifier every

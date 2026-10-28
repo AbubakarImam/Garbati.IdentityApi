@@ -212,6 +212,11 @@ namespace Garbati.IdentityApi.Migrations
                         .IsUnique()
                         .HasDatabaseName("ix_authorization_decisions_decision_id");
 
+                    b.HasIndex("RequestedBy", "IdempotencyKey")
+                        .IsUnique()
+                        .HasDatabaseName("ix_authorization_decisions_requested_by_idempotency_key_denied")
+                        .HasFilter("approved = false");
+
                     b.ToTable("authorization_decisions", (string)null);
                 });
 
