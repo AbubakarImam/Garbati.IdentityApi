@@ -7,6 +7,7 @@ using Garbati.IdentityApi.Entities;
 using Garbati.IdentityApi.Exceptions;
 using Garbati.IdentityApi.Signing;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace Garbati.IdentityApi.Services;
 
@@ -61,9 +62,13 @@ public class AuthorizationService(IdentityDbContext dbContext, IAuditLogger audi
 
         if (reasonCode is not null)
         {
-            await PersistDecisionAsync(decisionId, request, amount, now, approved: false, reasonCode, mandateId: null, cancellationToken);
+            // T-049: use the entity PersistDecisionAsync actually returns, not the locally-generated
+            // decisionId above - on a resolved duplicate (a retried denial), that local id was never
+            // actually persisted, so a caller seeing it could never look it up via GetDecisionAsync.
+            var decision = await PersistDecisionAsync(decisionId, request, amount, now, approved: false, reasonCode, mandateId: null, cancellationToken);
             throw new AuthorizationDeniedException(
-                decisionId, reasonCode, $"Authorization denied for decision '{decisionId}': {reasonCode}.");
+                decision.DecisionId, decision.DenialReason!,
+                $"Authorization denied for decision '{decision.DecisionId}': {decision.DenialReason}.");
         }
 
         // T-018: byte-for-byte what used to be inline here, moved into IssueApprovedGrantAsync so the
@@ -150,7 +155,7 @@ public class AuthorizationService(IdentityDbContext dbContext, IAuditLogger audi
 
         // Never log/audit the signed grant token itself (DESIGN.md Section 6.2, decision #13) - only the
         // decision id and outcome ever appear here.
-        auditLogger.Record(new AuditEvent
+        var audit = auditLogger.Record(new AuditEvent
         {
             Action = approved ? AuditActions.AuthorizationApproved : AuditActions.AuthorizationDenied,
             EntityType = nameof(AuthorizationDecision),
@@ -159,8 +164,48 @@ public class AuthorizationService(IdentityDbContext dbContext, IAuditLogger audi
             Details = approved ? $"mandateId: {mandateId}" : $"reason: {reasonCode}",
         });
 
-        await dbContext.SaveChangesAsync(cancellationToken);
-        return decision;
+        // T-049 (garbati-platform D-16): dedupe a RETRIED DENIAL, mirroring CustomerService.
+        // CreateCustomerAsync's exact shape - attempt the insert directly (no separate "check first" read,
+        // which would reintroduce the exact race the database constraint exists to close), catch the
+        // unique-violation, resolve by querying, compare canonical request fields, 409 on a real mismatch.
+        // An approved insert never hits the new index's filter (`WHERE approved = false`), so that case
+        // always falls through to the plain `return decision;` below, unchanged.
+        try
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return decision;
+        }
+        catch (DbUpdateException ex) when (!approved
+            && ex.InnerException is PostgresException { SqlState: "23505", ConstraintName:
+                "ix_authorization_decisions_requested_by_idempotency_key_denied" })
+        {
+            // Detach everything this attempt staged, or the retry (the next call on this same dbContext,
+            // if any) would try to save it a second time alongside later changes - same reason
+            // CreateCustomerAsync detaches its own staged Customer/IdentityData/audit row.
+            dbContext.Entry(decision).State = EntityState.Detached;
+            dbContext.Entry(audit).State = EntityState.Detached;
+
+            var existing = await dbContext.AuthorizationDecisions.AsNoTracking().FirstOrDefaultAsync(
+                d => d.RequestedBy == request.RequestedBy && d.IdempotencyKey == request.IdempotencyKey
+                    && !d.Approved, cancellationToken);
+
+            if (existing is null)
+                throw new InvalidOperationException("Error retrieving the result of the existing idempotency key.");
+
+            // Same key, different request: refuse rather than report the old denial as this one's (409) -
+            // compare the request's own canonical fields, not computed outputs like DenialReason.
+            if (existing.Operation != request.Operation
+                || existing.DebitAccountId != request.DebitAccountId
+                || existing.CreditAccountId != request.CreditAccountId
+                || existing.Amount != amount
+                || existing.Currency != request.Currency)
+            {
+                throw new DuplicateIdempotencyKeyException(
+                    $"Idempotency key '{request.IdempotencyKey}' was already used for a different request.");
+            }
+
+            return existing;
+        }
     }
 
     private static AuthorizationDecisionResponse ToDecisionResponse(AuthorizationDecision decision) => new(
