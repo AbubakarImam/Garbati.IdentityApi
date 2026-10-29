@@ -1044,4 +1044,78 @@ public class JointApprovalServiceTests(PostgresFixture fixture) : IAsyncLifetime
             CreateJointApprovalService(ctx).ListPendingRequestsAsync(
                 PendingApprovalRequestStatus.Pending, pageSize: 20, pageToken: "not-valid-base64!!!"));
     }
+
+    // --- D-29 (garbati-platform), second round of the same external-reviewer feedback T-053 pinned
+    // structurally (JointApprovalNoEditRegressionTests): "assert the request's content stays identical
+    // from creation through approval." That test proves no edit endpoint/method exists on the surface
+    // area at all; this one is behavioral - it actually drives a real 3-of-3 create-then-approve flow and
+    // diffs the canonical content at two independent re-fetch points, which would also catch a subtler bug
+    // (e.g. ApproveAsync accidentally reassigning a canonical field somewhere) that a structural test
+    // alone would not. Deliberately checks twice, not just at the end: once after the first explicit
+    // approval beyond the requester's own (still Pending - the actual "checker has it open" moment for a
+    // request still mid-collection), and again after the final approval that completes the threshold (now
+    // Approved) - both re-fetched independently via GetPendingRequestAsync rather than trusting
+    // ApproveAsync's own return value, the same way a checker re-opening the request would see it.
+    [Fact]
+    public async Task PendingApprovalRequest_CanonicalContentStaysIdentical_AcrossTheWholeThreeOfThreeApprovalFlow()
+    {
+        var customerA = await CreateCustomerAsync("Holder A Content Stability");
+        var customerB = await CreateCustomerAsync("Holder B Content Stability");
+        var customerC = await CreateCustomerAsync("Holder C Content Stability");
+        await AttachMandateAsync(customerA, "ACC-CONTENT-3OF3", "Debit");
+        await AttachMandateAsync(customerB, "ACC-CONTENT-3OF3", "Debit");
+        await AttachMandateAsync(customerC, "ACC-CONTENT-3OF3", "Debit");
+        await SetRequiredApprovalsAsync("ACC-CONTENT-3OF3", 3, customerA, customerB, customerC);
+
+        string requestId;
+        PendingApprovalRequestResponse snapshot;
+        await using (var ctx = fixture.CreateContext())
+        {
+            var result = await CreateJointApprovalService(ctx).RequestDebitAsync(
+                DebitRequest(customerA, "ACC-CONTENT-3OF3", amount: 12345.67m));
+            snapshot = Assert.IsType<DebitRequestResult.Pending>(result).Response;
+            requestId = snapshot.RequestId;
+            Assert.Equal(1, snapshot.ApprovalCount); // the requester's own approval, counted at creation
+        }
+
+        void AssertCanonicalFieldsUnchanged(PendingApprovalRequestResponse actual)
+        {
+            Assert.Equal(snapshot.Operation, actual.Operation);
+            Assert.Equal(snapshot.DebitAccountId, actual.DebitAccountId);
+            Assert.Equal(snapshot.CreditAccountId, actual.CreditAccountId);
+            Assert.Equal(snapshot.Amount, actual.Amount);
+            Assert.Equal(snapshot.Currency, actual.Currency);
+        }
+
+        // Checkpoint 1: Holder B's approval is the 2nd of 3 required - the threshold is NOT yet met, so
+        // this is exactly the multi-step "still mid-collection, a checker could have it open" moment.
+        // Re-fetched independently (not ApproveAsync's own return) to simulate a checker re-opening it.
+        await using (var ctx = fixture.CreateContext())
+        {
+            await CreateJointApprovalService(ctx).ApproveAsync(requestId, new ApproveRequest(customerB));
+        }
+
+        await using (var ctx = fixture.CreateContext())
+        {
+            var afterFirstApproval = await CreateJointApprovalService(ctx).GetPendingRequestAsync(requestId);
+            Assert.Equal("Pending", afterFirstApproval!.Status);
+            Assert.Equal(2, afterFirstApproval.ApprovalCount);
+            AssertCanonicalFieldsUnchanged(afterFirstApproval);
+        }
+
+        // Checkpoint 2: Holder C's approval is the 3rd and final one - the threshold is now met and a
+        // grant is issued. The canonical content must still match what customerA originally saw.
+        await using (var ctx = fixture.CreateContext())
+        {
+            await CreateJointApprovalService(ctx).ApproveAsync(requestId, new ApproveRequest(customerC));
+        }
+
+        await using (var ctx = fixture.CreateContext())
+        {
+            var afterFinalApproval = await CreateJointApprovalService(ctx).GetPendingRequestAsync(requestId);
+            Assert.Equal("Approved", afterFinalApproval!.Status);
+            Assert.Equal(3, afterFinalApproval.ApprovalCount);
+            AssertCanonicalFieldsUnchanged(afterFinalApproval);
+        }
+    }
 }
