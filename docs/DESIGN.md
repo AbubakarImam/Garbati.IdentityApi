@@ -290,7 +290,7 @@ The single-holder flow is "check one mandate, issue a grant" in one synchronous 
 - `Id` (the request-specific identifier every approval is bound to — decision #25, this is the nonce-equivalent that stops an approval given for one request ever counting toward a different one)
 - `LedgerAccountId`
 - `RequestedBy` (`CustomerId`)
-- Transaction intent: `Operation`, `DebitAccountId`, `CreditAccountId`, `Amount`, `Currency`, `IdempotencyKey` — the same canonical fields that will eventually appear in the grant (3.3), fixed at request-creation time so a later approval cannot be tricked into approving a changed transaction
+- Transaction intent: `Operation`, `DebitAccountId`, `CreditAccountId`, `Amount`, `Currency`, `IdempotencyKey` — the same canonical fields that will eventually appear in the grant (3.3), fixed at request-creation time so a later approval cannot be tricked into approving a changed transaction. This is deliberate and has no edit path today — pinned in code by `JointApprovalNoEditRegressionTests` (Appendix J, `garbati-platform` T-053/D-29).
 - `RequiredApprovals` (copied from the account's policy at request-creation time, so a concurrent policy change does not retroactively change what this specific request needs)
 - `Status`: `Pending`, `Approved`, `Expired`, `Cancelled`
 - `CreatedAt`, `ExpiresAt` (`CreatedAt + 1 hour` — decision #23)
@@ -1292,3 +1292,47 @@ coverage. Four pre-existing test files (`AuthorizationServiceTests`, `JointAppro
 `ReversalAuthorizationServiceTests`, and one test in `CustomerServiceTests` itself) that grant a KYC tier
 purely as unrelated test setup were updated to submit a throwaway identity number first - a real,
 necessary consequence of this task's new enforcement actually working, not a weakened or deleted test.
+
+## Appendix J. T-053 build notes (joint-approval "no edit path" regression test)
+
+This appendix records what `garbati-platform` T-053 (D-29) actually built. External feedback on D-29
+flagged a real, well-known class of bug: a checker reviews a pending maker-checker request, something
+mutates it before they approve, and the checker unknowingly approves different content than what they
+actually reviewed. The coordinator investigated directly against this repo's real code (not assumed) and
+confirmed no such race exists today for `PendingApprovalRequest` (3.8.2) — no code path mutates its
+canonical transaction fields (`Operation`, `DebitAccountId`, `CreditAccountId`, `Amount`, `Currency`,
+`RequestedRequiredApprovals`) after creation; `ApproveAsync` only ever appends an `ApprovalRecord` and, at
+threshold, writes `Status`/`DecisionId` (or the separate `MandateApprovalPolicy` row for a
+`ThresholdChange` request); `ExpireIfPastDueAsync` only writes `Status`. `PendingApprovalRequest.cs`'s own
+existing doc comment already states this is deliberate, a design decision from T-018, not something this
+task discovered for the first time — see 3.8.2's own text. T-053 is test-only: it pins that existing
+invariant in code so it cannot silently erode later.
+
+**Built:**
+
+- `JointApprovalNoEditRegressionTests` (`tests/.../Authorization/`): a closed-set reflection assertion on
+  `IJointApprovalService`'s public method names (`RequestDebitAsync`, `ApproveAsync`,
+  `GetPendingRequestAsync`, `GetApprovalPolicyAsync`, `RequestThresholdChangeAsync`,
+  `ListPendingRequestsAsync` — confirmed directly against `Services/Interfaces/IJointApprovalService.cs`
+  before writing the test, not copied from the task file), plus a theory asserting neither
+  `AuthorizationController` nor `AccountsController` carries an `HttpPutAttribute`/`HttpPatchAttribute` on
+  any public action. Deliberately a *closed* set, not merely "no method literally named Edit/Update" — any
+  new method on the interface, or any new PUT/PATCH action on either controller, fails this test and
+  forces a deliberate look at whether the addition reopens the TOCTOU risk, the same way
+  `ControllerAuthorizationTests` (Appendix D-adjacent, 5.2) already pins the scope-policy invariant.
+- Proved the test actually catches the regression it exists for, not just that it passes today: temporarily
+  added a throwaway `EditPendingRequestAsync` method to `IJointApprovalService`/`JointApprovalService` and
+  a throwaway `[HttpPut]` action to `AuthorizationController`, confirmed both new assertions failed with a
+  clear message naming the offending member, then reverted both throwaway changes (confirmed via `git diff`
+  that the working tree matched `main` again before committing the test).
+
+**Deliberately not built (scope boundary, confirmed before starting, not an oversight):**
+
+- **No production code change of any kind.** This task is test-only, per its own task file.
+- **No "withdraw my own pending request" endpoint.** The investigation separately noticed
+  `PendingApprovalRequestStatus.Cancelled` is defined but never written anywhere — a real but minor
+  product gap, out of scope for this task, left for the owner to decide on separately.
+
+**Tests:** `JointApprovalNoEditRegressionTests` (3 cases: the interface closed-set check, and the
+controller PUT/PATCH check run as a theory over both controllers). Full existing suite re-run and confirmed
+unaffected (expected, since no production code changed).
