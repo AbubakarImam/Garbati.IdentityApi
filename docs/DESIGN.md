@@ -1325,6 +1325,21 @@ invariant in code so it cannot silently erode later.
   a throwaway `[HttpPut]` action to `AuthorizationController`, confirmed both new assertions failed with a
   clear message naming the offending member, then reverted both throwaway changes (confirmed via `git diff`
   that the working tree matched `main` again before committing the test).
+- **Second round, same reviewer, same D-29 thread:** a complementary *behavioral* test,
+  `JointApprovalServiceTests.PendingApprovalRequest_CanonicalContentStaysIdentical_AcrossTheWholeThreeOfThreeApprovalFlow`.
+  Where `JointApprovalNoEditRegressionTests` proves no edit surface exists structurally, this one actually
+  drives a real 3-of-3 create-then-approve flow (reusing this file's existing `CreateCustomerAsync`/
+  `AttachMandateAsync`/`SetRequiredApprovalsAsync` fixtures, no new pattern invented) and diffs
+  `Operation`/`DebitAccountId`/`CreditAccountId`/`Amount`/`Currency` against a snapshot taken at creation,
+  re-fetched independently via `GetPendingRequestAsync` (not trusting `ApproveAsync`'s own return) at two
+  points: after the first non-requester approval (still `Pending` — the actual "checker has it open"
+  moment mid-collection) and after the final approval that completes the threshold (now `Approved`). This
+  would also catch a subtler bug a structural test cannot — e.g. `ApproveAsync` accidentally reassigning a
+  canonical field somewhere along the way. Proved it the same way: temporarily added a line reassigning
+  `pending.Amount` right before `ApproveAsync`'s first `SaveChangesAsync`, confirmed the new test failed
+  with a clear "Strings differ: Expected 12345.67, Actual 999999.99" message at the first checkpoint, then
+  reverted it and confirmed `git diff origin/main` for the touched production file was empty before
+  committing the real test.
 
 **Deliberately not built (scope boundary, confirmed before starting, not an oversight):**
 
@@ -1334,5 +1349,7 @@ invariant in code so it cannot silently erode later.
   product gap, out of scope for this task, left for the owner to decide on separately.
 
 **Tests:** `JointApprovalNoEditRegressionTests` (3 cases: the interface closed-set check, and the
-controller PUT/PATCH check run as a theory over both controllers). Full existing suite re-run and confirmed
-unaffected (expected, since no production code changed).
+controller PUT/PATCH check run as a theory over both controllers), plus
+`JointApprovalServiceTests.PendingApprovalRequest_CanonicalContentStaysIdentical_AcrossTheWholeThreeOfThreeApprovalFlow`
+(1 case, added in the same PR for the same reviewer's follow-up). Full existing suite re-run and confirmed
+unaffected (expected, since no production code changed) — 364/364 passing.
