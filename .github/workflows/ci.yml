@@ -69,7 +69,10 @@ jobs:
   # this repo's main branch and a Website Contributor role assignment scoped to garbati-identityapi only.
   deploy:
     needs: [test, docker]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # Disabled 4 Nov 2026: the Azure subscription itself is disabled (ReadOnlyDisabledSubscription,
+    # a billing issue, not a code problem -- garbati-platform/TASKS.md Section C). Re-enable by
+    # restoring: if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: false
     runs-on: ubuntu-latest
     permissions:
       id-token: write # lets azure/login exchange GitHub's OIDC token: no Azure password is stored anywhere
