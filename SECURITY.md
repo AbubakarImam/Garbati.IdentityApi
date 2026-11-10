@@ -2,7 +2,7 @@
 
 GARBATI is a core-banking platform. A real vulnerability here could mean a forged authorization grant, a replayed or duplicated transaction, or exposure of a customer's identity data. We take reports seriously and ask that you report privately, before anything is made public.
 
-This policy applies to every repository in the GARBATI platform: `garbati-platform`, `LedgerApi`, `Garbati.IdentityApi`, `Garbati.OrchestratorApi`, `Garbati.StaffIdentityApi`, `Garbati.OpsApi`, and `garbati-ops-console`.
+This policy applies to every repository in the GARBATI platform: `garbati-platform`, `LedgerApi`, `Garbati.IdentityApi`, `Garbati.OrchestratorApi`, `Garbati.StaffIdentityApi`, `Garbati.OpsApi`, `Garbati.ProductApi`, `Garbati.ScheduleApi`, and `garbati-ops-console`.
 
 ## Reporting a vulnerability
 
